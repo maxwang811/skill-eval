@@ -49,6 +49,10 @@ class EvaluationOptions:
     # Supplied by the orchestration input, never inferred from repository state:
     # the tree that runs the evaluator is not the tree being evaluated.
     evaluated_source: dict[str, str] | None = None
+    # ``--judge-panel``: replaces the host SKILL_EVAL_JUDGE_PANEL when set; a blank
+    # value turns the panel off and ignores the SKILL_EVAL_JUDGE_PANEL_* knobs.
+    # ``None`` keeps the host value. Never read from the skill.
+    judge_panel: str | None = None
 
     def engine_kwargs(self) -> dict[str, Any]:
         """Return keyword arguments (excluding ``skill_path``) for the engine."""

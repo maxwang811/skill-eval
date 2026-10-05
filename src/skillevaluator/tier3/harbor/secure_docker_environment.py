@@ -39,6 +39,9 @@ SECURE_DOCKER_ENV_IMPORT_PATH = (
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _NVIDIA_BUILD_FILE_SENTINEL = "skillevaluator-file-backed-nvidia-key"
 _NVIDIA_BUILD_KEY_FILE_ENV = "SKILLEVALUATOR_NVIDIA_API_KEY_FILE"
+# The runner's private judge panel alias for a member's NVIDIA Build key; the
+# job-level verifier env resolves NVIDIA_API_KEY from it.
+_JUDGE_PANEL_NVIDIA_API_KEY_ALIAS = "SKILLEVALUATOR_JUDGE_PANEL__NVIDIA_API_KEY"
 # Match llm_judge / local_environment: short env values like "1" must not
 # become substring secrets or loopback origins such as 127.0.0.1 break.
 _MIN_EXACT_SECRET_LENGTH = 8
@@ -187,7 +190,10 @@ class SkillEvaluatorDockerEnvironment(DockerEnvironment):
     @classmethod
     def preflight(cls) -> None:
         """Consume the private stdin handoff before Docker can inherit it."""
-        if os.environ.get("NVIDIA_API_KEY", "").strip() == NVIDIA_BUILD_STDIN_SENTINEL:
+        if any(
+            os.environ.get(name, "").strip() == NVIDIA_BUILD_STDIN_SENTINEL
+            for name in ("NVIDIA_API_KEY", _JUDGE_PANEL_NVIDIA_API_KEY_ALIAS)
+        ):
             read_nvidia_build_key_from_stdin()
         super().preflight()
 

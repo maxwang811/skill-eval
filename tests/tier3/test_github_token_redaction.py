@@ -74,11 +74,12 @@ def _near_miss_text(copies: int) -> str:
 
 
 def _best_elapsed(pattern, text: str, repeats: int = 5) -> float:
+    # Thread CPU time leaves out time spent descheduled, which wall-clock time counts on a busy machine.
     best = float("inf")
     for _ in range(repeats):
-        started = time.perf_counter()
+        started = time.thread_time()
         pattern.sub("", text)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.thread_time() - started)
     return best
 
 

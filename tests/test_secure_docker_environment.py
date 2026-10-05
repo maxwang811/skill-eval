@@ -350,6 +350,94 @@ def test_harbor_subprocess_receives_nvidia_key_only_over_stdin(monkeypatch, tmp_
     assert other_secret not in repr(other_handoff)
 
 
+def test_harbor_subprocess_receives_judge_panel_member_nvidia_key_only_over_stdin(monkeypatch, tmp_path: Path) -> None:
+    from skillevaluator.tier3.harbor import runner, secure_docker_environment
+
+    secret = "nvidia-member-secret-value-for-test"
+    primary_secret = "openai-primary-secret-value-for-test"
+    alias = runner._JUDGE_PANEL_NVIDIA_API_KEY_ALIAS
+    assert alias == secure_docker_environment._JUDGE_PANEL_NVIDIA_API_KEY_ALIAS
+
+    def fake_run(command, **kwargs):
+        environment = kwargs["env"]
+        assert secret not in command
+        assert secret not in environment.values()
+        assert environment[alias] == runner._NVIDIA_BUILD_STDIN_SENTINEL
+        assert environment[runner._NVIDIA_BUILD_KEY_STDIN_ENV] == "1"
+        assert "NVIDIA_API_KEY" not in environment
+        assert environment["OPENAI_API_KEY"] == primary_secret
+        assert kwargs["input"] == secret
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "_validate_harbor_job_result", lambda *_args, **_kwargs: (True, ""))
+
+    ok, detail = runner._run_harbor(
+        dataset=tmp_path / "dataset",
+        agent="opencode",
+        job_name="secure-member",
+        env_mode="docker",
+        model="openai/gpt-5.6-sol",
+        jobs_dir=tmp_path / "jobs",
+        run_env={"SKILL_EVAL_LLM_PROVIDER": "openai", "OPENAI_API_KEY": primary_secret, alias: secret},
+        n_attempts=1,
+        n_concurrent=1,
+        timeout_multiplier=1.0,
+        override_cpus=None,
+        override_memory_mb=None,
+        override_storage_mb=None,
+        verifier_env={"NVIDIA_API_KEY": f"${{{alias}}}"},
+    )
+
+    assert (ok, detail) == (True, "")
+
+
+def test_secure_docker_preflight_consumes_a_judge_panel_member_stdin_key(monkeypatch) -> None:
+    from harbor.environments.docker.docker import DockerEnvironment
+
+    from skillevaluator.tier3.harbor import runner, secure_docker_environment, sensitive_stdin
+
+    secret = "nvidia-member-secret-value-for-test"
+    observed: list[str] = []
+    monkeypatch.setattr(sensitive_stdin._nvidia_build_key_cache, "value", sensitive_stdin._UNSET)
+    monkeypatch.setattr(sensitive_stdin.sys, "stdin", io.StringIO(secret))
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.setenv(secure_docker_environment._JUDGE_PANEL_NVIDIA_API_KEY_ALIAS, runner._NVIDIA_BUILD_STDIN_SENTINEL)
+    monkeypatch.setenv(runner._NVIDIA_BUILD_KEY_STDIN_ENV, "1")
+
+    def docker_preflight(_cls) -> None:
+        assert sensitive_stdin._nvidia_build_key_cache.value == secret
+        observed.append(secret)
+        assert sensitive_stdin.sys.stdin.read() == ""
+
+    monkeypatch.setattr(DockerEnvironment, "preflight", classmethod(docker_preflight))
+
+    secure_docker_environment.SkillEvaluatorSecureDockerEnvironment.preflight()
+
+    assert observed == [secret]
+    # The job-level verifier env resolves NVIDIA_API_KEY to the alias's sentinel.
+    resolved = secure_docker_environment._host_handoff_environment(
+        {"NVIDIA_API_KEY": runner._NVIDIA_BUILD_STDIN_SENTINEL}
+    )
+    assert resolved["NVIDIA_API_KEY"] == secret
+
+
+def test_secure_docker_preflight_leaves_stdin_alone_without_a_sentinel(monkeypatch) -> None:
+    from harbor.environments.docker.docker import DockerEnvironment
+
+    from skillevaluator.tier3.harbor import secure_docker_environment, sensitive_stdin
+
+    monkeypatch.setattr(sensitive_stdin._nvidia_build_key_cache, "value", sensitive_stdin._UNSET)
+    monkeypatch.setattr(sensitive_stdin.sys, "stdin", io.StringIO("unrelated-input"))
+    monkeypatch.setenv("NVIDIA_API_KEY", "ordinary-key")
+    monkeypatch.setenv(secure_docker_environment._JUDGE_PANEL_NVIDIA_API_KEY_ALIAS, "another-ordinary-key")
+    monkeypatch.setattr(DockerEnvironment, "preflight", classmethod(lambda _cls: None))
+
+    secure_docker_environment.SkillEvaluatorSecureDockerEnvironment.preflight()
+
+    assert sensitive_stdin.sys.stdin.read() == "unrelated-input"
+
+
 def test_harbor_subprocess_redacts_stdin_key_from_early_failure(monkeypatch, tmp_path: Path) -> None:
     from skillevaluator.tier3.harbor import runner
 

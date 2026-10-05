@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -27,6 +27,8 @@ from skillevaluator.constants import (
 from skillevaluator.logging_config import setup_logging
 from skillevaluator.models.result import ValidationResult
 from skillevaluator.reporting.console_ui import (
+    MUTED,
+    TierRow,
     ValidateView,
     ViewProgressReporter,
     check_ticker_row,
@@ -63,6 +65,9 @@ from skillevaluator.utils.tier2_paths import (
     paths_refer_to_same_location,
     sanitize_tier2_results,
 )
+
+if TYPE_CHECKING:
+    from skillevaluator.provider_config import JudgePanelConfig
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
@@ -111,6 +116,9 @@ _TIER2_GROUP = "Tier 2 · Deduplication"
 _TIER2_GROUP_DESC = "Embedding + LLM dedup; on by default, skips gracefully without a provider key."
 _TIER3_GROUP = "Tier 3 · Live Agent Evaluation"
 _TIER3_GROUP_DESC = "On by default for skills, with automatic dataset preparation; advisory unless made blocking."
+_JUDGE_PANEL_HELP = (
+    "Cross-model judge panel for the three LLM metrics as provider:model,...; overrides SKILL_EVAL_JUDGE_PANEL."
+)
 
 # Detailed, sectioned epilog for ``validate --help`` (parity with
 # ``skill-evaluator validate -h``). Authored pre-formatted and rendered raw.
@@ -576,6 +584,32 @@ def _evaluated_source_from_options(
     return identity or None
 
 
+def _resolve_cli_judge_panel(judge_panel: str | None) -> JudgePanelConfig | None:
+    """Resolve the run's judge panel before any paid Tier 3 work starts.
+
+    Raises ``ValueError`` for an invalid panel. Without the Tier 3 extra the
+    panel cannot be resolved here; the engine then reports the missing
+    dependency as it did before.
+    """
+    try:
+        from skillevaluator.tier3.commands import resolve_judge_panel_option
+    except ImportError:
+        return None
+    return resolve_judge_panel_option(judge_panel)
+
+
+def _judge_panel_cli_warnings(panel: JudgePanelConfig | None, grading_mode: str | None) -> tuple[str, ...]:
+    """Return the panel's advisory warnings to print at the CLI boundary.
+
+    On screen the engine shows them only in a progress event, which
+    ``--progress off`` and ``validate``'s views do not keep. ``custom_only``
+    grading runs no standard judges, so the panel's advice does not apply.
+    """
+    if panel is None or grading_mode == "custom_only":
+        return ()
+    return panel.warnings
+
+
 def _run_agent_eval_or_skip(
     target_path: Path,
     *,
@@ -599,6 +633,7 @@ def _run_agent_eval_or_skip(
     block_on_agent_eval: bool = False,
     validate_source: bool = True,
     evaluated_source: dict[str, str] | None = None,
+    judge_panel: str | None = None,
     progress_reporter=None,
 ) -> ValidationResult:
     """Run Tier 3 live agent evaluation and fold the result into the combined report.
@@ -649,6 +684,7 @@ def _run_agent_eval_or_skip(
         harbor_keep_jobs=harbor_keep_jobs,
         agent_runtime_preflight=agent_runtime_preflight,
         evaluated_source=evaluated_source,
+        judge_panel=judge_panel,
     )
     try:
         service = EvaluationService()
@@ -940,6 +976,9 @@ def _catalog_child_argv_from_ctx(ctx: click.Context, skill_dir: Path, output_dir
         argv.extend(["--agent-model", str(override)])
     if params.get("grading_mode"):
         argv.extend(["--grading-mode", str(params["grading_mode"])])
+    # Forward a blank value too: it deliberately disables the host panel.
+    if params.get("judge_panel") is not None:
+        argv.extend(["--judge-panel", str(params["judge_panel"])])
     if params.get("results_dir"):
         argv.extend(["--results-dir", str(params["results_dir"])])
     for skill in params.get("include_skills") or ():
@@ -1555,6 +1594,13 @@ def _print_run_banner(target_path: Path, content_type: str, profile: str | None)
     help="Reward/grading mode for live eval.",
 )
 @click.option(
+    "--judge-panel",
+    default=None,
+    cls=GroupedOption,
+    help_group=_TIER3_GROUP,
+    help=_JUDGE_PANEL_HELP,
+)
+@click.option(
     "--results-dir",
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
     default=None,
@@ -1653,6 +1699,7 @@ def validate(
     model: str | None,
     agent_model: tuple[str, ...],
     grading_mode: str | None,
+    judge_panel: str | None,
     results_dir: Path | None,
     include_skills: tuple[Path, ...],
     copy_repo: bool,
@@ -1873,11 +1920,26 @@ def validate(
             detail_row("model", model_display),
         ]
 
+        # Resolve the judge panel before autopilot's paid dataset generation;
+        # an invalid panel skips Tier 3 with the configuration error.
+        judge_panel_error: str | None = None
+        try:
+            judge_panel_config = _resolve_cli_judge_panel(judge_panel)
+        except Exception as exc:
+            judge_panel_error = str(exc)
+        else:
+            for warning in _judge_panel_cli_warnings(judge_panel_config, grading_mode):
+                if quiet:
+                    # Rows after the first three stay visible once the tier finishes.
+                    tier3_config_rows.append(TierRow("judge panel", [(warning, MUTED)], glyph="⚠"))
+                else:
+                    click.echo(f"Warning: {warning}", err=True)
+
         # Autopilot: reuse the standalone evaluate command's dataset flow.
         # Tier 3 is advisory, so a dataset-generation failure must not abort
         # validate after Tier 1/2 already ran -- Tier 3 skips with the reason.
         autopilot_error: str | None = None
-        if autopilot:
+        if autopilot and judge_panel_error is None:
             view.tier_progress(
                 tier3_index, [*tier3_config_rows, stage_hint_row("status", "preparing evaluation dataset…")]
             )
@@ -1891,39 +1953,49 @@ def validate(
                 if dataset_note:
                     tier3_config_rows.append(detail_row("dataset", dataset_note))
 
-        view.tier_progress(
-            tier3_index,
-            [*tier3_config_rows, stage_hint_row("status", "running with-skill and baseline trials…")],
-        )
+        if judge_panel_error is not None:
+            from skillevaluator.evaluation.tier3_report import advisory_skip_result
 
-        def _on_engine_tail(lines: list[str]) -> None:
-            view.tier_progress(tier3_index, [*tier3_config_rows, *engine_feed_rows(lines)])
+            # Matches what _run_agent_eval_or_skip reports when the engine rejects the panel.
+            tier3_result = advisory_skip_result(
+                f"Tier 3 live evaluation skipped: {judge_panel_error}",
+                skill_name=tier3_path.name,
+            )
+        else:
+            view.tier_progress(
+                tier3_index,
+                [*tier3_config_rows, stage_hint_row("status", "running with-skill and baseline trials…")],
+            )
 
-        reporter = ViewProgressReporter(_on_engine_tail) if quiet else None
-        tier3_result = _run_agent_eval_or_skip(
-            tier3_path,
-            agents=agents,
-            env_mode=env_mode,
-            skip_baseline=skip_baseline,
-            n_concurrent=n_concurrent,
-            max_agents=max_agents,
-            n_attempts=n_attempts,
-            pass_threshold=pass_threshold,
-            stop_on_pass=stop_on_pass,
-            model=model,
-            agent_model=agent_model,
-            grading_mode=grading_mode,
-            results_dir=results_dir,
-            include_skills=include_skills,
-            copy_repo=copy_repo,
-            timeout_multiplier=timeout_multiplier,
-            harbor_keep_jobs=harbor_keep_jobs,
-            agent_runtime_preflight=agent_runtime_preflight,
-            block_on_agent_eval=block_on_agent_eval_effective,
-            validate_source=preflight_tier3_source,
-            evaluated_source=evaluated_source,
-            progress_reporter=reporter,
-        )
+            def _on_engine_tail(lines: list[str]) -> None:
+                view.tier_progress(tier3_index, [*tier3_config_rows, *engine_feed_rows(lines)])
+
+            reporter = ViewProgressReporter(_on_engine_tail) if quiet else None
+            tier3_result = _run_agent_eval_or_skip(
+                tier3_path,
+                agents=agents,
+                env_mode=env_mode,
+                skip_baseline=skip_baseline,
+                n_concurrent=n_concurrent,
+                max_agents=max_agents,
+                n_attempts=n_attempts,
+                pass_threshold=pass_threshold,
+                stop_on_pass=stop_on_pass,
+                model=model,
+                agent_model=agent_model,
+                grading_mode=grading_mode,
+                results_dir=results_dir,
+                include_skills=include_skills,
+                copy_repo=copy_repo,
+                timeout_multiplier=timeout_multiplier,
+                harbor_keep_jobs=harbor_keep_jobs,
+                agent_runtime_preflight=agent_runtime_preflight,
+                block_on_agent_eval=block_on_agent_eval_effective,
+                validate_source=preflight_tier3_source,
+                evaluated_source=evaluated_source,
+                judge_panel=judge_panel,
+                progress_reporter=reporter,
+            )
         results.append(tier3_result)
         tier3_ran, tier3_ok, tier3_rows, tier3_skip = summarize_tier3(tier3_result)
         if autopilot_error and not tier3_ran:
@@ -2444,6 +2516,7 @@ def _tier2_workflow(
 @click.option("--include-skills", multiple=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--copy-repo", is_flag=True)
 @click.option("--grading-mode", type=GRADING_MODE_CHOICE, default=None)
+@click.option("--judge-panel", default=None, help=_JUDGE_PANEL_HELP)
 @click.option("--results-dir", type=click.Path(file_okay=False, dir_okay=True, path_type=Path), default=None)
 @click.option("--harbor-keep-jobs", is_flag=True)
 @click.option(
@@ -2497,6 +2570,7 @@ def evaluate(
     include_skills: tuple[Path, ...],
     copy_repo: bool,
     grading_mode: str | None,
+    judge_panel: str | None,
     results_dir: Path | None,
     harbor_keep_jobs: bool,
     agent_runtime_preflight: bool | None,
@@ -2521,6 +2595,13 @@ def evaluate(
         evaluated_source_revision,
         evaluator_container_revision,
     )
+    # Checked before autopilot, whose dataset generation is a paid LLM call.
+    try:
+        judge_panel_config = _resolve_cli_judge_panel(judge_panel)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    for warning in _judge_panel_cli_warnings(judge_panel_config, grading_mode):
+        click.echo(f"Warning: {warning}", err=True)
     if autopilot:
         _ensure_autopilot_dataset(skill_path, progress=progress)
 
@@ -2549,6 +2630,7 @@ def evaluate(
         override_memory_mb=override_memory_mb,
         override_storage_mb=override_storage_mb,
         evaluated_source=evaluated_source,
+        judge_panel=judge_panel,
     )
     try:
         if env_mode == "local":
@@ -2744,7 +2826,10 @@ def models_command(limit: int, as_json: bool) -> None:
 @click.option(
     "--verify-models",
     is_flag=True,
-    help="Check resolved agent-model catalog reachability with a live credential-bearing request.",
+    help=(
+        "Check catalog reachability for each resolved agent model and, with a judge panel, each panel member, "
+        "using live credential-bearing requests."
+    ),
 )
 def doctor(agents: str | None, env_mode: str, agent_model: tuple[str, ...], verify_models: bool) -> None:
     """Check live-evaluation runtime readiness."""

@@ -1675,7 +1675,11 @@ def test_partial_headers_time_out_without_exceeding_the_worker_bound(
 def test_slow_drip_request_line_and_headers_obey_an_absolute_deadline(
     bridge_services: _BridgeServices, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(bridge, "REQUEST_HEADER_TIMEOUT_SECONDS", 0.05)
+    # Long enough that a briefly descheduled test thread still sees the dripping worker.
+    monkeypatch.setattr(bridge, "REQUEST_HEADER_TIMEOUT_SECONDS", 0.4)
+    server = bridge_services.bridge_server
+    # The fixture's health-check worker can still be finishing after its response arrived.
+    assert server.wait_for_workers(timeout=2)
     stop_sending = Event()
     with socket.create_connection(("127.0.0.1", bridge_services.port), timeout=2) as client:
 
@@ -1690,14 +1694,12 @@ def test_slow_drip_request_line_and_headers_obey_an_absolute_deadline(
         sender = Thread(target=drip_headers)
         sender.start()
         try:
-            deadline = time.monotonic() + 1
-            while bridge_services.bridge_server.active_workers == 0 and time.monotonic() < deadline:
+            deadline = time.monotonic() + 2
+            while not (workers := server.active_workers) and time.monotonic() < deadline:
                 time.sleep(0.005)
-            assert bridge_services.bridge_server.active_workers == 1
-            deadline = time.monotonic() + 1
-            while bridge_services.bridge_server.active_workers and time.monotonic() < deadline:
-                time.sleep(0.005)
-            assert bridge_services.bridge_server.active_workers == 0
+            assert workers == 1
+            # The drip outpaces the per-read socket timeout, so the worker drains through the absolute deadline.
+            assert server.wait_for_workers(timeout=2)
         finally:
             stop_sending.set()
             sender.join(timeout=1)

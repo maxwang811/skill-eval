@@ -753,6 +753,9 @@ def build_agent_eval_payload(
     }
     if harbor_summary:
         payload["harbor_viewer"] = harbor_summary
+    judge_panels = _report_judge_panels(agents)
+    if judge_panels:
+        payload = _with_judge_panel(payload, judge_panels)
 
     _layer_llm_insights(
         payload,
@@ -997,6 +1000,13 @@ def _enforce_report_payload_budget(payload: dict[str, Any], report_budget: _Repo
     if _serialized_payload_size(payload) <= _MAX_EMBEDDED_REPORT_BYTES:
         return
 
+    # Judge-panel disagreement cases go first: the per-judge and agreement
+    # tables stay, and each agent's judge_panel.json keeps the cases on disk.
+    if _prune_judge_panel_disagreement_cases(payload, report_budget):
+        refresh_signal()
+        if _serialized_payload_size(payload) <= _MAX_EMBEDDED_REPORT_BYTES:
+            return
+
     provenance = payload.get("provenance")
     if isinstance(provenance, dict):
         comparison = provenance.get("comparison")
@@ -1144,6 +1154,265 @@ def _replace_with_minimal_payload(payload: dict[str, Any], report_budget: _Repor
     payload.clear()
     payload.update(compact)
     report_budget.omit("payload_sections")
+
+
+# ---------------------------------------------------------------------------
+# Judge panel
+# ---------------------------------------------------------------------------
+
+_JUDGE_PANEL_METRICS = ("accuracy", "goal_accuracy", "behavior_check")
+_JUDGE_PANEL_SCORE_KEYS = (*_JUDGE_PANEL_METRICS, "llm_overall")
+_JUDGE_PANEL_CONDITIONS = ("with_skill", "without_skill")
+_JUDGE_PANEL_AGGREGATIONS = ("vote", "median", "mean")
+_MAX_REPORT_JUDGES = 16
+_MAX_REPORT_DISAGREEMENT_CASES = 50
+_MAX_JUDGE_PANEL_TEXT = 512
+_MAX_JUDGE_PANEL_ID_TEXT = 256
+
+
+def _report_judge_panels(agents: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return display-safe judge panel data for each agent whose run used a judge panel."""
+    panels: dict[str, dict[str, Any]] = {}
+    for name in sorted(agents):
+        info = agents[name]
+        panel = _report_judge_panel(info.get("judge_panel") if isinstance(info, dict) else None)
+        if panel is not None:
+            panels[name] = panel
+    return panels
+
+
+def _with_judge_panel(payload: dict[str, Any], judge_panels: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Insert judge panel data after the overview sections, just before ``dataset``.
+
+    The bounded HTML preview spends its character budget in key order. Up to 50
+    disagreement cases with a 512-character reason per judge must not use up the
+    budget of the dimensions, insights, conclusions, and recommendations
+    rendered from the same preview.
+    """
+    ordered: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key == "dataset":
+            ordered["judge_panel"] = judge_panels
+        ordered[key] = value
+    ordered.setdefault("judge_panel", judge_panels)
+    return ordered
+
+
+def _report_judge_panel(raw: object) -> dict[str, Any] | None:
+    """Normalize one agent's ``judge_panel.json`` into the shape the HTML template renders.
+
+    The artifact is read back from the results directory, so every field is
+    type-checked and bounded; an unusable value becomes ``None`` instead of
+    reaching the template. Well-formed collector output passes through
+    unchanged. Returns ``None`` when no judge is named.
+    """
+    if not isinstance(raw, dict):
+        return None
+    judges = _report_panel_judges(raw.get("judges"))
+    if not judges:
+        return None
+    labels = {judge["judge"] for judge in judges}
+    per_judge = raw.get("per_judge") if isinstance(raw.get("per_judge"), dict) else {}
+    agreement = raw.get("agreement") if isinstance(raw.get("agreement"), dict) else {}
+    signs = raw.get("lift_signs") if isinstance(raw.get("lift_signs"), dict) else {}
+    sign_consistent = raw.get("lift_sign_consistent")
+    aggregation = raw.get("aggregation")
+    quorum = raw.get("quorum")
+    cases, unlisted_cases = _report_panel_cases(raw.get("disagreement_cases"), labels)
+    return {
+        "schema_version": _panel_text(raw.get("schema_version"), 32),
+        "metrics": list(_JUDGE_PANEL_METRICS),
+        "aggregation": aggregation if aggregation in _JUDGE_PANEL_AGGREGATIONS else None,
+        "quorum": quorum if isinstance(quorum, int) and not isinstance(quorum, bool) and quorum >= 1 else None,
+        "disagreement_threshold": _finite_float(raw.get("disagreement_threshold")),
+        "judges": judges,
+        "agent_model": _panel_text(raw.get("agent_model")),
+        "agent_family": _panel_text(raw.get("agent_family"), 64),
+        "per_judge": {judge["judge"]: _report_panel_judge(judge, per_judge.get(judge["judge"])) for judge in judges},
+        "agreement": {metric: _report_panel_agreement(agreement.get(metric)) for metric in _JUDGE_PANEL_METRICS},
+        "lift_sign_consistent": sign_consistent if isinstance(sign_consistent, bool) else None,
+        "lift_signs": {
+            label: sign
+            for label, sign in signs.items()
+            if label in labels and isinstance(sign, int) and not isinstance(sign, bool) and sign in (-1, 0, 1)
+        },
+        "same_family_judges": _report_panel_labels(raw.get("same_family_judges"), labels),
+        "lift_excluding_same_family": _report_panel_excluding(raw.get("lift_excluding_same_family"), labels),
+        "same_family_comparison": _report_panel_comparison(raw.get("same_family_comparison")),
+        "disagreement_cases": cases,
+        "disagreement_cases_truncated": _as_nonnegative_int(raw.get("disagreement_cases_truncated")) + unlisted_cases,
+    }
+
+
+def _panel_text(value: object, limit: int = _MAX_JUDGE_PANEL_TEXT) -> str | None:
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _report_panel_judges(raw: object) -> list[dict[str, Any]]:
+    judges: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = _panel_text(item.get("judge"))
+        if not label or any(judge["judge"] == label for judge in judges):
+            continue
+        judges.append(
+            {
+                "judge": label,
+                "provider": _panel_text(item.get("provider"), 64),
+                "model": _panel_text(item.get("model")),
+                "family": _panel_text(item.get("family"), 64),
+                "same_family": item.get("same_family") is True,
+            }
+        )
+        if len(judges) >= _MAX_REPORT_JUDGES:
+            break
+    return judges
+
+
+def _report_panel_judge(judge: dict[str, Any], raw: object) -> dict[str, Any]:
+    entry = raw if isinstance(raw, dict) else {}
+    counts = entry.get("n") if isinstance(entry.get("n"), dict) else {}
+    skipped = entry.get("n_skipped") if isinstance(entry.get("n_skipped"), dict) else {}
+    failed = entry.get("failed") if isinstance(entry.get("failed"), dict) else {}
+    return {
+        "provider": judge["provider"],
+        "model": judge["model"],
+        "family": judge["family"],
+        "with_skill": _report_panel_scores(entry.get("with_skill"), _JUDGE_PANEL_SCORE_KEYS),
+        "without_skill": _report_panel_scores(entry.get("without_skill"), _JUDGE_PANEL_SCORE_KEYS),
+        "lift": _report_panel_scores(entry.get("lift"), _JUDGE_PANEL_SCORE_KEYS),
+        "n": {condition: _report_panel_counts(counts.get(condition)) for condition in _JUDGE_PANEL_CONDITIONS},
+        "n_skipped": {condition: _report_panel_counts(skipped.get(condition)) for condition in _JUDGE_PANEL_CONDITIONS},
+        "failed": {condition: _as_nonnegative_int(failed.get(condition)) for condition in _JUDGE_PANEL_CONDITIONS},
+    }
+
+
+def _report_panel_scores(raw: object, keys: tuple[str, ...]) -> dict[str, float | None]:
+    values = raw if isinstance(raw, dict) else {}
+    return {key: _finite_float(values.get(key)) for key in keys}
+
+
+def _report_panel_counts(raw: object) -> dict[str, int]:
+    values = raw if isinstance(raw, dict) else {}
+    return {metric: _as_nonnegative_int(values.get(metric)) for metric in _JUDGE_PANEL_METRICS}
+
+
+def _report_panel_agreement(raw: object) -> dict[str, Any]:
+    values = raw if isinstance(raw, dict) else {}
+    return {
+        "fleiss_kappa": _finite_float(values.get("fleiss_kappa")),
+        "kappa_items": _as_nonnegative_int(values.get("kappa_items")),
+        "krippendorff_alpha": _finite_float(values.get("krippendorff_alpha")),
+        "alpha_units": _as_nonnegative_int(values.get("alpha_units")),
+        "observed_agreement": _finite_float(values.get("observed_agreement")),
+    }
+
+
+def _report_panel_labels(raw: object, labels: set[str]) -> list[str]:
+    items = raw if isinstance(raw, list) else []
+    return list(dict.fromkeys(label for label in items if isinstance(label, str) and label in labels))
+
+
+def _report_panel_excluding(raw: object, labels: set[str]) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    excluded = _report_panel_labels(raw.get("excluded"), labels)
+    remaining = _report_panel_labels(raw.get("judges"), labels)
+    if raw.get("available") is not True:
+        return {"excluded": excluded, "judges": remaining, "available": False}
+    metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+    lift_keys = ("with_skill", "without_skill", "delta")
+    reference = raw.get("reference") if isinstance(raw.get("reference"), dict) else {}
+    reference_metrics = reference.get("metrics") if isinstance(reference.get("metrics"), dict) else {}
+    return {
+        "excluded": excluded,
+        "judges": remaining,
+        "available": True,
+        "metrics": {metric: _report_panel_scores(metrics.get(metric), lift_keys) for metric in _JUDGE_PANEL_METRICS},
+        "llm_overall": _report_panel_scores(raw.get("llm_overall"), lift_keys),
+        "overall": _report_panel_scores(raw.get("overall"), lift_keys),
+        "reference": {
+            "subsets": _as_nonnegative_int(reference.get("subsets")),
+            "metrics": {
+                metric: _report_panel_scores(reference_metrics.get(metric), ("delta",))
+                for metric in _JUDGE_PANEL_METRICS
+            },
+            "llm_overall": _report_panel_scores(reference.get("llm_overall"), ("delta",)),
+            "overall": _report_panel_scores(reference.get("overall"), ("delta",)),
+        },
+        "same_family_gap": _finite_float(raw.get("same_family_gap")),
+    }
+
+
+def _report_panel_comparison(raw: object) -> dict[str, float | None] | None:
+    if not isinstance(raw, dict):
+        return None
+    return {
+        key: _finite_float(raw.get(key)) for key in ("same_family_mean_llm_lift", "other_judges_mean_llm_lift", "gap")
+    }
+
+
+def _report_panel_cases(raw: object, labels: set[str]) -> tuple[list[dict[str, Any]], int]:
+    """Return at most the collector's case cap, plus the count of valid cases beyond it."""
+    cases: list[dict[str, Any]] = []
+    unlisted = 0
+    for item in raw if isinstance(raw, list) else []:
+        case = _report_panel_case(item, labels)
+        if case is None:
+            continue
+        if len(cases) >= _MAX_REPORT_DISAGREEMENT_CASES:
+            unlisted += 1
+            continue
+        cases.append(case)
+    return cases, unlisted
+
+
+def _report_panel_case(raw: object, labels: set[str]) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    metric = raw.get("metric")
+    condition = raw.get("condition")
+    if metric not in _JUDGE_PANEL_METRICS or condition not in _JUDGE_PANEL_CONDITIONS:
+        return None
+    scores = raw.get("scores") if isinstance(raw.get("scores"), dict) else {}
+    reasons = raw.get("reasons") if isinstance(raw.get("reasons"), dict) else {}
+    case: dict[str, Any] = {
+        "entry_id": _panel_text(raw.get("entry_id"), _MAX_JUDGE_PANEL_ID_TEXT) or "",
+        "trial_id": _panel_text(raw.get("trial_id"), _MAX_JUDGE_PANEL_ID_TEXT) or "",
+    }
+    if step := _panel_text(raw.get("step"), _MAX_JUDGE_PANEL_ID_TEXT):
+        case["step"] = step
+    case.update(
+        {
+            "condition": condition,
+            "metric": metric,
+            "spread": _finite_float(raw.get("spread")),
+            "scores": {label: _finite_float(score) for label, score in scores.items() if label in labels},
+            "reasons": {
+                label: reason[:_MAX_JUDGE_PANEL_TEXT]
+                for label, reason in reasons.items()
+                if label in labels and isinstance(reason, str)
+            },
+        }
+    )
+    return case
+
+
+def _prune_judge_panel_disagreement_cases(payload: dict[str, Any], report_budget: _ReportBudget) -> int:
+    """Drop every agent's judge-panel disagreement cases, counting them as unlisted; return how many."""
+    panels = payload.get("judge_panel")
+    omitted = 0
+    for panel in panels.values() if isinstance(panels, dict) else ():
+        cases = panel.get("disagreement_cases") if isinstance(panel, dict) else None
+        if isinstance(cases, list) and cases:
+            omitted += len(cases)
+            panel["disagreement_cases"] = []
+            panel["disagreement_cases_truncated"] = _as_nonnegative_int(
+                panel.get("disagreement_cases_truncated")
+            ) + len(cases)
+    report_budget.omit("judge_panel_disagreement_cases", omitted)
+    return omitted
 
 
 # ---------------------------------------------------------------------------
@@ -1510,7 +1779,12 @@ def _metric_evidence(
 
         failures: list[str] = []
         results = detail.get("results")
-        if isinstance(results, list):
+        if metric == "behavior_check" and isinstance(detail.get("panel"), dict):
+            from skillevaluator.tier3.harbor.judge_panel_stats import panel_behavior_failures
+
+            # A judge panel's per-behavior reason is a vote tally; keep a judge's rationale and list ties.
+            failures = panel_behavior_failures(detail)[:3]
+        elif isinstance(results, list):
             for result in results:
                 if not isinstance(result, dict) or result.get("passed") is not False:
                     continue

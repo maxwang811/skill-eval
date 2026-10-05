@@ -238,6 +238,7 @@ The following flags are forwarded to the live-eval engine when Tier 3 is enabled
 | `--model TEXT` | unset | Global agent model override. |
 | `--agent-model TEXT` | unset | Per-agent model override, `AGENT=MODEL` (repeatable). |
 | `--grading-mode [default\|default_plus_custom\|custom_only]` | unset | Reward/grading mode for live eval. |
+| `--judge-panel TEXT` | `$SKILL_EVAL_JUDGE_PANEL`, else one judge | Cross-model judge panel for the three LLM metrics as `provider:model,...` (one to five members); overrides `SKILL_EVAL_JUDGE_PANEL`, and `--judge-panel ''` turns the panel off. The panel is checked before autopilot prepares a dataset: an invalid panel skips Tier 3 with the configuration error, which gates the exit code only with `--block-on-agent-eval`. Panel warnings appear as a `judge panel` row in the Tier 3 section, or on stderr with `--verbose`. See [Cross-model judging](tier3-live-evaluation.mdx#cross-model-judging). |
 | `--results-dir DIRECTORY` | unset | Directory for Harbor live-eval results. |
 | `--include-skills PATH` | none | Additional skill(s) to mount into the eval environment (repeatable; paths must exist). Requires group workspace mode, set via `skill_workspace.mode: group` in `evals/config.yml`. |
 | `--copy-repo` | off | Copy the surrounding repo into the eval environment. |
@@ -245,7 +246,7 @@ The following flags are forwarded to the live-eval engine when Tier 3 is enabled
 | `--harbor-keep-jobs` | off | Retain Harbor job dirs and artifacts after the run for inspection. |
 | `--agent-runtime-preflight / --no-agent-runtime-preflight` | disabled | Opt into an extra agent-only execution of the first staged task before the measured A/B matrix. The CLI value overrides `harbor.agent_runtime_preflight`; without either, no extra agent runs. |
 
-Flags marked "unset" fall back to their matching keys in `evals/config.yml` where one exists, then to the built-in defaults ([Eval Datasets](eval-datasets.mdx) documents the config keys and precedence). The exception is `--results-dir`, which resolves independently of `evals/config.yml` (see [Reports & Results](reports.mdx)).
+Flags marked "unset" fall back to their matching keys in `evals/config.yml` where one exists, then to the built-in defaults ([Eval Datasets](eval-datasets.mdx) documents the config keys and precedence). The exception is `--results-dir`, which resolves independently of `evals/config.yml` (see [Reports & Results](reports.mdx)). `--judge-panel` has no `evals/config.yml` key: the judge panel comes only from the host.
 
 ### Evaluated source provenance
 
@@ -397,6 +398,7 @@ Use `skillevaluator tier3 PATH` for the complete workflow with automatic missing
 | `--include-skills PATH` | none | Additional skill(s) to mount into the eval environment (repeatable; paths must exist). Requires group workspace mode (`--skill-workspace-mode group` or `skill_workspace.mode: group` in `evals/config.yml`). |
 | `--copy-repo` | off | Copy the surrounding repo into the eval environment. |
 | `--grading-mode [default\|default_plus_custom\|custom_only]` | unset | Reward/grading mode — see [Custom Graders & Tasks](custom-graders.mdx). The legacy aliases `aces_default` (→ `default`) and `aces_plus_custom` (→ `default_plus_custom`) are still accepted. |
+| `--judge-panel TEXT` | `$SKILL_EVAL_JUDGE_PANEL`, else one judge | Cross-model judge panel for the three LLM metrics as `provider:model,...` (one to five members); overrides `SKILL_EVAL_JUDGE_PANEL` for this run, and `--judge-panel ''` turns the panel off. Aggregation, quorum, and disagreement settings still come from the environment. An invalid panel fails before the run starts, and before `--autopilot` generates a dataset; panel warnings print to stderr. Under `custom_only` grading the panel is validated but not used. See [Cross-model judging](tier3-live-evaluation.mdx#cross-model-judging). |
 | `--results-dir DIRECTORY` | unset | Directory for live-eval results (precedence rules in [Reports & Results](reports.mdx)). |
 | `--harbor-keep-jobs` | off | Retain Harbor job dirs and artifacts for inspection with [harbor-view](#harbor-view). |
 | `--agent-runtime-preflight / --no-agent-runtime-preflight` | disabled | Opt into an extra agent-only execution of the first staged task before the full A/B evaluation matrix. |
@@ -415,7 +417,7 @@ Without a `--model`/`--agent-model` override, agent execution uses
 last value as `nvidia/nvidia/nemotron-3-super-120b-a12b` because its adapter
 namespace precedes the NVIDIA catalog ID.
 
-Flags marked "unset" fall back to their matching keys in `evals/config.yml` where one exists, then to the built-in defaults. The exception is `--results-dir`, which resolves independently of `evals/config.yml`.
+Flags marked "unset" fall back to their matching keys in `evals/config.yml` where one exists, then to the built-in defaults. The exception is `--results-dir`, which resolves independently of `evals/config.yml`. `--judge-panel` has no `evals/config.yml` key: the judge panel comes only from the host.
 
 ## create-eval-dataset
 
@@ -495,6 +497,8 @@ skillevaluator compare ./my-skill
 | --- | --- | --- |
 | `--results-dir DIRECTORY` | unset | Results directory to read from. |
 
+For an agent whose run used a judge panel, the table adds a `judges κ/α` column showing Fleiss' κ and Krippendorff's α for the three LLM metrics (see [Reports & Results](reports.mdx#judge-panel)).
+
 ## harbor-view
 
 Open retained Harbor job artifacts with Harbor's trajectory browser. Takes a jobs directory as its argument and has no options. Jobs are only retained when the original run passed `--harbor-keep-jobs`. `skillevaluator tier3 harbor-view` is an identical tier-prefixed spelling.
@@ -516,7 +520,9 @@ skillevaluator doctor --env-mode docker
 | `-a, --agents TEXT` | provider-native | Comma-separated agents to check. Defaults: NVIDIA Build=`opencode`, OpenAI=`codex`, Anthropic=`claude-code`. |
 | `--env-mode` | `docker` | Backend to check (same 16 values as [tier3 evaluate](#tier3-evaluate)). |
 | `--agent-model TEXT` | unset | Per-agent model override, `AGENT=MODEL` (repeatable) — check readiness with the model each agent will actually run. |
-| `--verify-models` | off | Live per-agent catalog probe. Prints pass for verified access, warn for an inconclusive or non-authoritative result (success or failure), and fail only for a definitive credential, model, or configuration rejection. |
+| `--verify-models` | off | Live per-agent catalog probe. Prints pass for verified access, warn for an inconclusive or non-authoritative result (success or failure), and fail only for a definitive credential, model, or configuration rejection. With a judge panel configured, it also probes every panel member as a `judge PROVIDER:MODEL` row with the same semantics. |
+
+When the environment configures a judge panel, `doctor` also adds a **Judge panel** row. It passes with the members, aggregation, and quorum; warns when an even member count uses `vote` aggregation; and fails with the configuration error, including when a `SKILL_EVAL_JUDGE_PANEL_*` setting is present without `SKILL_EVAL_JUDGE_PANEL`. Without any panel setting, the row is omitted. `doctor` has no `--judge-panel` flag; it checks the panel in `SKILL_EVAL_JUDGE_PANEL`.
 
 `skillevaluator tier3 doctor` takes the same flags, including `--agent-model` and `--verify-models`.
 

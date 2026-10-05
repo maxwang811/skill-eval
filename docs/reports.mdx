@@ -187,6 +187,7 @@ completed run directly:
       - codex/
         - lift.json
         - pass_at_k_lift.json
+        - judge_panel.json
         - with-skill/
           - summary.json
           - trials/
@@ -206,6 +207,12 @@ completed run directly:
 - **`<agent>/lift.json`** and **`<agent>/pass_at_k_lift.json`** — per-metric
   deltas between the two arms; written only when both arms produced scores
   (a `--skip-baseline` run has neither).
+- **`<agent>/judge_panel.json`** — per-judge scores and lift, inter-judge
+  agreement, same-family checks, and high-disagreement cases; written only
+  when a [judge panel](#judge-panel) scored the run and at least one scored
+  trial carries per-judge verdicts. `result.json` carries the same summary
+  under each agent's `judge_panel` key, with a case count in place of the case
+  list.
 - **`<agent>/{with-skill,without-skill}/`** — each arm's `summary.json`
   (scores, dimensions, pass@k, trial counts) and a `trials/` directory of
   per-trial artifacts.
@@ -258,7 +265,8 @@ Dimension scores are 0.0–1.0 rollups of the underlying evaluation signals. The
 verdict bands are fixed: a dimension **passes** at 0.50 or above, is
 **neutral** from 0.40 to below 0.50, and **fails** below 0.40. The judge runs on
 the configured provider model; override it per run as described in
-[Tier 3: Live Evaluation](tier3-live-evaluation.mdx).
+[Tier 3: Live Evaluation](tier3-live-evaluation.mdx), or score with a
+[cross-model judge panel](#judge-panel).
 
 ### Skill Lift
 
@@ -317,6 +325,111 @@ make heterogeneous cases independent, correct dataset leakage, or promote a
 small p-value into proof that a skill generalizes. Keep the dataset, attempt
 policy, agent, model, and environment fixed when interpreting them.
 
+### Judge Panel
+
+When a run used a
+[cross-model judge panel](tier3-live-evaluation.mdx#cross-model-judging), the
+HTML report adds a **Judge Panel** section for each agent, backed by
+`<agent>/judge_panel.json`. Dimension scores, Skill Lift, and verdicts already
+use the panel's aggregated scores; this section shows whether that consensus
+deserves trust, and it changes no score.
+
+- **Per-judge lift.** Each judge's with-skill and without-skill means for
+  `accuracy`, `goal_accuracy`, and `behavior_check`, their average (LLM
+  overall), and that judge's lift. A judge's means cover the trials it judged
+  successfully; a trial whose judge failed has no value for that judge. When
+  a case skips a metric — `behavior_check` without `assertions`, or
+  `accuracy` and `goal_accuracy` without an expected output — no judge scores
+  it, and its judge-independent score of 1.0 counts for every judge, as it
+  does in the headline means. In the JSON, `n` counts the trials each judge
+  actually judged, `n_skipped` the skipped ones, both per arm and metric, and
+  `failed` the trial metrics the judge failed in each arm. A native
+  multi-step trial whose Harbor result supplies its aggregate reward carries
+  no per-judge verdicts, so it is left out of every panel statistic,
+  including the lift without same-family judges and its reference, while its
+  scores still count in the headline means.
+- **Agreement.** For each metric, pooled across both arms and all trials:
+  Fleiss' κ on the judges' boolean verdicts (the five accuracy criteria, each
+  expected behavior, and whether the goal was achieved) and Krippendorff's α
+  (interval) on their 0–1 scores, which tolerates failed members. Values below
+  0.4 are highlighted yellow and values below 0.2 red. A statistic reads
+  `n/a` when it is undefined. κ and the observed agreement need at least one
+  rated item, such as an accuracy criterion, that two or more judges answered
+  successfully, so a one-judge panel always reads `n/a` for both. κ is also
+  undefined when every verdict from every judge is the same;
+  `observed_agreement` then still reports the raw agreement rate. α needs at
+  least one trial scored by two or more judges and is undefined when every
+  score is the same.
+- **Lift direction.** When one judge's LLM-overall lift points up and
+  another's points down, a warning reads "Judges disagree on the direction of
+  the skill lift" (`lift_sign_consistent` is `false`). The conclusion then
+  depends on the judge, so treat the agent's LLM-metric lift as inconclusive
+  until more cases or attempts settle it. A flat lift is compatible with
+  either direction: a judge that sees no change next to one that sees a gain
+  raises no warning. With two or more judges but fewer than two LLM-overall
+  lifts, for example because the baseline was skipped or a judge failed every
+  trial of a metric, the report says the sign check is unavailable and
+  `lift_sign_consistent` is `null`.
+- **Same-family judges.** Judges from the agent model's family carry a badge,
+  and a note compares them with the rest of the panel in two ways. First, the
+  same-family judges' mean LLM-overall lift against the other judges' mean,
+  from the per-judge table (`same_family_comparison`, whose `gap` is the
+  same-family mean minus the others'); this comparison does not depend on how
+  verdicts are aggregated. It is `null` when either side has no LLM-overall
+  lift, for example when every judge shares the agent's family or the
+  baseline was skipped. Second, the lift re-voted without the same-family
+  judges (`lift_excluding_same_family`) next to a `reference` that drops as
+  many other-family judges instead, averaged over every such choice.
+  `same_family_gap` is the reference's LLM-overall lift minus the re-voted
+  one, so a positive gap means that panels keeping the same-family judges
+  show a larger lift. Compare the re-voted lift with its reference and with
+  the per-judge lifts, never with the headline Skill Lift: under `vote` and
+  `median`, re-voting fewer judges changes the lift by itself (with `vote`,
+  two judges tie at 0.5 where three form a majority), while `mean` has no
+  such effect. When fewer other-family than same-family judges took part, no
+  reference exists and its `subsets` count is 0; when every judge is
+  same-family, no lift without them is available.
+- **Disagreement cases.** Trials where one metric's judge scores span at
+  least `SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT` (0.4 by default). Each case
+  names the eval case, the trial when its ID differs from the case ID, the
+  step of a multi-step trial, the metric, and the arm; expand it to read each
+  judge's score and reasoning. `judge_panel.json` keeps up to 50 cases and
+  counts the rest.
+
+Rule-of-thumb readings for Fleiss' κ:
+
+| Fleiss' κ | Agreement |
+| --- | --- |
+| below 0.2 | Slight or poor |
+| 0.2 to 0.4 | Fair |
+| 0.4 to 0.6 | Moderate |
+| 0.6 to 0.8 | Substantial |
+| above 0.8 | Almost perfect |
+
+For Krippendorff's α, 0.8 or above is conventionally reliable, and 0.667 to
+0.8 supports only tentative conclusions; lower values support none, even where
+the report does not highlight them. Low agreement means the rubric is
+ambiguous for these cases or one judge is out of step with the others, so read
+the disagreement cases before trusting a small lift.
+
+With a panel, the report's evidence cards and quality findings explain a
+failed expected behavior with the vote tally and the reasoning of a judge that
+did not observe it, as in `1/3 judges observed this behavior: ...`. A tied
+behavior, which counts as 0.5, is listed too and marked `(tied)`.
+
+When a panel run scores trials but none of them carries per-judge verdicts,
+for example because every trial is a native multi-step trial whose Harbor
+result supplies the aggregate reward, or every case skips every LLM metric,
+there is no `judge_panel.json` and no Judge Panel section. `result.json` then
+carries a warning saying that judge panel statistics are unavailable.
+
+Panel detail stays out of the numeric reward: the verifier's `reward.json`
+keeps its six metric scores plus `overall`, and each LLM metric's `details`
+entry in the trial record gains a `panel` block with every member's verdict,
+the score spread, the agreement rate, the disagreement flag, and the
+failed-member count. Custom-metric extraction and `custom_lift.json` are
+therefore unaffected.
+
 ## Browse results
 
 ### view
@@ -338,6 +451,11 @@ are ignored, so a failed run can't masquerade as a score.
 ```bash title="Compare stored results across agents"
 skillevaluator compare ./my-skill
 ```
+
+When an agent's run used a judge panel, `compare` adds a **judges κ/α** column
+after that agent's columns. Its `accuracy`, `goal_accuracy`, and
+`behavior_check` rows show Fleiss' κ and Krippendorff's α as `κ/α`, such as
+`0.61/0.70`, with `-` for an undefined value.
 
 Both commands accept `--results-dir` to read from a non-default location.
 
@@ -365,7 +483,8 @@ For CI and tooling, two JSON entry points matter:
 
 - **Standalone `tier3 evaluate` runs** — parse `result.json` in the run
   directory (or follow `latest`). It carries per-agent scores, dimensions,
-  lift, pass@k, trial counts, the attempt policy, and execution status.
+  lift, pass@k, trial counts, the attempt policy, and execution status, plus a
+  per-agent `judge_panel` summary when a judge panel scored the run.
   Unscored metrics stay unscored rather than defaulting to 0.0, so
   `overall_score` can be `null`.
 - **`validate --tier3` runs** — the combined

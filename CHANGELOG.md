@@ -27,11 +27,39 @@ All notable changes to SkillEvaluator are documented in this file.
 - Tier 3 log converters now rebuild ATIF trajectories from OpenCode JSON streams
   (`opencode.txt`) and structured Codex tee logs (`codex.txt`) when
   `trajectory.json` is missing or empty.
+- Tier 3 cross-model judge panel: `SKILL_EVAL_JUDGE_PANEL` (or `--judge-panel`
+  on `tier3 evaluate`, `tier3 PATH`, and `validate`; `--judge-panel ''` turns
+  it off for one run) scores `accuracy`, `goal_accuracy`, and `behavior_check`
+  with up to five `provider:model` judges, combined by per-criterion majority
+  vote, median, or mean; below the quorum a metric fails closed instead of
+  scoring zero. Only the operator configures the panel, and each member uses
+  its own provider credential and endpoint, delivered through Harbor's
+  job-level verifier environment rather than the agent's launch environment.
+  The verifier shares the agent's task environment, so code the evaluated
+  skill controls can read member keys: use dedicated, spend-capped judge keys.
+  A panel run therefore refuses a `default_plus_custom` mode selected only by
+  the skill's `evals/config.yml` and native tasks with a separate verifier
+  environment. It also refuses an `openai-compatible` member alongside an
+  `openai` or `anthropic` primary, and warns when native verifier timeouts are
+  below the panel's budget or when an `anthropic` member's key also moves
+  Claude Code off a gateway. The panel is validated before autopilot generates
+  a dataset, and its warnings print at the CLI. Reports add a Judge Panel
+  section and `<agent>/judge_panel.json` (per-judge lift, Fleiss' kappa,
+  Krippendorff's alpha, a lift-direction check, a same-family comparison with
+  a like-for-like reference, and high-disagreement cases); `compare` adds a
+  judge-agreement column, and `doctor --verify-models` probes every member.
+  Runs without a panel score exactly as before.
+- Staged Tier 3 task Dockerfiles now reset the four `SKILL_EVAL_JUDGE_PANEL*`
+  names to empty values after all authored layers, so a skill's image cannot
+  configure a judge panel. Scores are unchanged; the first run after upgrading
+  rebuilds the final layers of each task image once.
 
 ### Fixed
 
 - Harbor ``result.json`` case ids now prefer canonical ``task_id.path`` metadata
   over repository-prefixed ``task_name`` values when resolving eval entries.
+- Tier 3 report loading no longer leaks a file descriptor when an artifact
+  path is a directory; it records a `json_file_type` diagnostic instead.
 - Codex log synthesis maps ``web_search`` action payloads and ``collab_tool_call``
   thread items into ATIF, and error-recovery checks recognize ``status=failed`` /
   ``exit_code=`` terminal evidence emitted by Codex converters.

@@ -19,6 +19,7 @@ from typing import Any
 from skillevaluator.evidence import evidence_ref_identity
 from skillevaluator.tier3.eval_core.llm_judge import _redact_configured_credentials
 from skillevaluator.tier3.harbor import report_data
+from skillevaluator.tier3.harbor.judge_panel_stats import panel_behavior_failures
 from skillevaluator.tier3.harbor.metrics import (
     DEFAULT_METRICS,
     METRIC_DESCRIPTIONS,
@@ -341,14 +342,22 @@ def _collect_fail_reasons(metric: str, trials: list[dict[str, Any]]) -> list[str
         detail = trial["detail"]
 
         if metric == "behavior_check":
-            for r in detail.get("results", []):
-                if not r.get("passed") and r.get("reason"):
-                    reasons.append(r["reason"])
+            if isinstance(detail.get("panel"), dict):
+                # A judge panel's per-behavior reason is a vote tally; keep a judge's rationale.
+                reasons.extend(panel_behavior_failures(detail))
+            else:
+                for r in detail.get("results", []):
+                    if not r.get("passed") and r.get("reason"):
+                        reasons.append(r["reason"])
 
         elif metric == "accuracy":
             criteria = detail.get("criteria", {})
+            # A judge panel's tied criterion is None and counts as 0.5: neither passed nor failed.
+            panel_vote = isinstance(detail.get("panel"), dict)
             for crit, passed in criteria.items():
-                if not passed:
+                if passed is None and panel_vote:
+                    reasons.append(f"{crit} tied between judges")
+                elif not passed:
                     reasons.append(f"{crit} failed")
             if detail.get("reason"):
                 reasons.append(detail["reason"])

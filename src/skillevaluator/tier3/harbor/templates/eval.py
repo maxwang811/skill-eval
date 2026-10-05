@@ -33,12 +33,14 @@ import random
 import re
 import shlex
 import signal
+import statistics
 import sys
 import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from contextvars import ContextVar
 from fnmatch import fnmatchcase
 from functools import lru_cache
@@ -1357,6 +1359,410 @@ def _compact_behavior_conversation(conversation_text, limit=None):
     return f"{conversation_text[:head]}{marker}{conversation_text[-tail:]}"
 
 
+# ── Cross-Model Judge Panel ──────────────────────────────────────────────────
+
+# --- BEGIN SHARED JUDGE PANEL HELPERS (verbatim copy in harbor/templates/eval.py) ---
+# A judge panel scores each LLM metric with several provider:model judges and
+# aggregates their verdicts. The standalone verifier cannot import skillevaluator,
+# so templates/eval.py carries a byte-for-byte copy of this block, enforced by a
+# parity test. Use only builtins, math, re, statistics, ContextVar, NamedTuple,
+# Any, and Mapping here.
+
+
+class JudgeTarget(NamedTuple):
+    """Name one judge panel member by provider and model id."""
+
+    provider: str
+    model: str
+
+
+class JudgePanelSettings(NamedTuple):
+    """Hold a validated judge panel and its aggregation settings."""
+
+    members: tuple[JudgeTarget, ...]
+    aggregation: str
+    quorum: int
+    disagreement_threshold: float
+
+
+# Set while one panel member judges so provider calls route to that member only.
+_ACTIVE_JUDGE_TARGET: ContextVar[JudgeTarget | None] = ContextVar("active_judge_target", default=None)
+
+JUDGE_PANEL_ENV = "SKILL_EVAL_JUDGE_PANEL"
+JUDGE_PANEL_AGGREGATION_ENV = "SKILL_EVAL_JUDGE_PANEL_AGGREGATION"
+JUDGE_PANEL_QUORUM_ENV = "SKILL_EVAL_JUDGE_PANEL_QUORUM"
+JUDGE_PANEL_DISAGREEMENT_ENV = "SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT"
+JUDGE_PANEL_AGGREGATIONS = ("vote", "median", "mean")
+JUDGE_PANEL_MAX_MEMBERS = 5
+DEFAULT_JUDGE_PANEL_DISAGREEMENT = 0.4
+
+_JUDGE_PANEL_PROVIDERS = ("anthropic", "bedrock", "nv_build", "openai", "openai-compatible")
+_JUDGE_PANEL_METRICS = ("accuracy", "goal_accuracy", "behavior_check")
+_JUDGE_PANEL_CRITERIA = ("SKILL_IDENTIFIED", "ACTION_CORRECT", "FACTUALLY_ACCURATE", "TASK_ADDRESSED", "ACTIONABLE")
+_JUDGE_PANEL_TEXT_LIMIT = 512
+# Bedrock ids name the vendor after an optional inference-profile region, as in us.anthropic.claude-opus-5.
+_MODEL_FAMILY_VENDOR_RE = re.compile(
+    r"^(?:(?:us|eu|apac|ap|ca|jp|au|global|us-gov)\.)?"
+    r"(anthropic|meta|mistral|amazon|cohere|ai21|deepseek|qwen|openai|google|nvidia)\."
+)
+# Any vendor in that position, so ids of unlisted Bedrock vendors such as zai.glm-4.6 reach the model name.
+_MODEL_FAMILY_ANY_VENDOR_RE = re.compile(r"^(?:(?:us|eu|apac|ap|ca|jp|au|global|us-gov)\.)?[a-z0-9-]+\.")
+_MODEL_FAMILY_O_SERIES_RE = re.compile(r"^o\d+(?:$|[-_.:])")
+_MODEL_FAMILY_PREFIXES = {
+    "anthropic": ("claude",),
+    "openai": ("gpt", "chatgpt", "codex", "davinci"),
+    "nvidia": ("nemotron", "nvidia"),
+    "meta": ("llama", "meta-llama"),
+    "mistral": ("mistral", "mixtral", "codestral", "ministral", "magistral", "devstral", "pixtral"),
+    "google": ("gemini", "gemma"),
+    "qwen": ("qwen", "qwq"),
+    "deepseek": ("deepseek",),
+    "microsoft": ("phi",),
+    "ibm": ("granite",),
+    "xai": ("grok",),
+    "moonshot": ("kimi",),
+    "zhipu": ("glm",),
+    "amazon": ("nova", "titan"),
+    "cohere": ("command",),
+    "ai21": ("jamba",),
+}
+_MODEL_FAMILY_ORGS = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "nvidia": "nvidia",
+    "meta": "meta",
+    "meta-llama": "meta",
+    "mistralai": "mistral",
+    "mistral": "mistral",
+    "google": "google",
+    "qwen": "qwen",
+    "deepseek-ai": "deepseek",
+    "deepseek": "deepseek",
+    "microsoft": "microsoft",
+    "ibm": "ibm",
+    "ibm-granite": "ibm",
+    "xai": "xai",
+    "moonshotai": "moonshot",
+    "zhipuai": "zhipu",
+    "thudm": "zhipu",
+    "amazon": "amazon",
+    "cohere": "cohere",
+}
+# nv_build, bedrock, and gateways host many families, so only these providers imply one.
+_MODEL_FAMILY_PROVIDERS = {"openai": "openai", "anthropic": "anthropic"}
+
+
+def parse_judge_panel_env(environ: Mapping[str, str]) -> JudgePanelSettings | None:
+    """Return the configured judge panel, or ``None`` when ``SKILL_EVAL_JUDGE_PANEL`` is unset or blank.
+
+    Raises ``ValueError`` for any invalid setting so callers fail closed rather
+    than silently falling back to a single judge.
+    """
+    panel_text = str(environ.get(JUDGE_PANEL_ENV) or "").strip()
+    knobs = {
+        name: str(environ.get(name) or "").strip()
+        for name in (JUDGE_PANEL_AGGREGATION_ENV, JUDGE_PANEL_QUORUM_ENV, JUDGE_PANEL_DISAGREEMENT_ENV)
+    }
+    if not panel_text:
+        if orphans := [name for name, value in knobs.items() if value]:
+            raise ValueError(f"{', '.join(orphans)} set without {JUDGE_PANEL_ENV}; name the judges or unset the knobs")
+        return None
+
+    members: list[JudgeTarget] = []
+    for raw_entry in panel_text.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            raise ValueError(f"{JUDGE_PANEL_ENV} contains an empty entry")
+        # Split on the first colon only: Bedrock model ids such as ...-v1:0 contain colons.
+        provider, _, model = entry.partition(":")
+        target = JudgeTarget(provider.strip().lower(), model.strip())
+        if not target.provider or not target.model:
+            raise ValueError(f"{JUDGE_PANEL_ENV} entry {entry!r} must have the form provider:model")
+        if target.provider not in _JUDGE_PANEL_PROVIDERS:
+            raise ValueError(
+                f"{JUDGE_PANEL_ENV} entry {entry!r} has unsupported provider {target.provider!r}; "
+                f"expected one of: {', '.join(_JUDGE_PANEL_PROVIDERS)}"
+            )
+        # isprintable() is False exactly for Unicode "Other" and "Separator" characters.
+        if any(character.isspace() for character in target.model) or not target.model.isprintable():
+            raise ValueError(
+                f"{JUDGE_PANEL_ENV} model {target.model!r} must not contain whitespace or control characters"
+            )
+        if target in members:
+            raise ValueError(f"{JUDGE_PANEL_ENV} lists {target.provider}:{target.model} more than once")
+        if target.provider == "openai-compatible" and any(member.provider == target.provider for member in members):
+            raise ValueError(
+                f"{JUDGE_PANEL_ENV} may name at most one openai-compatible judge because "
+                "SKILL_EVAL_LLM_BASE_URL and SKILL_EVAL_LLM_API_KEY configure a single gateway"
+            )
+        members.append(target)
+    if len(members) > JUDGE_PANEL_MAX_MEMBERS:
+        raise ValueError(
+            f"{JUDGE_PANEL_ENV} names {len(members)} judges; at most {JUDGE_PANEL_MAX_MEMBERS} are allowed"
+        )
+
+    aggregation = knobs[JUDGE_PANEL_AGGREGATION_ENV].lower() or "vote"
+    if aggregation not in JUDGE_PANEL_AGGREGATIONS:
+        raise ValueError(f"{JUDGE_PANEL_AGGREGATION_ENV} must be one of: {', '.join(JUDGE_PANEL_AGGREGATIONS)}")
+    quorum = len(members) // 2 + 1
+    if quorum_text := knobs[JUDGE_PANEL_QUORUM_ENV]:
+        try:
+            quorum = int(quorum_text)
+        except ValueError:
+            quorum = 0  # rejected by the range check below
+        if not 1 <= quorum <= len(members):
+            raise ValueError(f"{JUDGE_PANEL_QUORUM_ENV} must be an integer from 1 to {len(members)}")
+    threshold = DEFAULT_JUDGE_PANEL_DISAGREEMENT
+    if threshold_text := knobs[JUDGE_PANEL_DISAGREEMENT_ENV]:
+        try:
+            threshold = float(threshold_text)
+        except ValueError:
+            threshold = math.nan
+        # The chained comparison is False for NaN, so nan and inf fail with out-of-range values.
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"{JUDGE_PANEL_DISAGREEMENT_ENV} must be a number from 0 to 1")
+    return JudgePanelSettings(tuple(members), aggregation, quorum, threshold)
+
+
+def _model_family_by_prefix(name: str) -> str | None:
+    if _MODEL_FAMILY_O_SERIES_RE.match(name):
+        return "openai"
+    for family, prefixes in _MODEL_FAMILY_PREFIXES.items():
+        for prefix in prefixes:
+            # The prefix must end at a non-letter: phi-4 is Microsoft, philosopher-7b is not.
+            if name.startswith(prefix) and not name[len(prefix) : len(prefix) + 1].isalpha():
+                return family
+    return None
+
+
+def _model_family(provider: str | None, model: str | None) -> str:
+    """Infer a model family from the model id, falling back to the provider only when the id is unknown.
+
+    Hosted catalogs mix vendors, so the id decides: nv_build serves
+    ``nvidia/llama-3.1-nemotron-70b-instruct``, a Meta model. ``"unknown"``
+    never counts as the same family as anything.
+    """
+    segments = [segment for segment in str(model or "").strip().casefold().split("/") if segment]
+    leaf = segments[-1].removeprefix("bedrock-") if segments else ""
+    if vendor := _MODEL_FAMILY_VENDOR_RE.match(leaf):
+        return vendor.group(1)
+    family = _model_family_by_prefix(leaf)
+    if family is None and (unlisted_vendor := _MODEL_FAMILY_ANY_VENDOR_RE.match(leaf)):
+        family = _model_family_by_prefix(leaf[unlisted_vendor.end() :])
+    if family is not None:
+        return family
+    for segment in reversed(segments[:-1]):
+        if org_family := _MODEL_FAMILY_ORGS.get(segment):
+            return org_family
+    return _MODEL_FAMILY_PROVIDERS.get(str(provider or "").strip().casefold(), "unknown")
+
+
+def _judge_panel_text(value: Any) -> str:
+    text = value.strip() if isinstance(value, str) else ""
+    if len(text) > _JUDGE_PANEL_TEXT_LIMIT:
+        text = text[: _JUDGE_PANEL_TEXT_LIMIT - 3] + "..."
+    return text
+
+
+def _judge_panel_behavior_results(result: dict[str, Any]) -> list[dict[str, Any]] | None:
+    results = result.get("results")
+    if isinstance(results, list) and all(
+        isinstance(item, dict) and isinstance(item.get("passed"), bool) for item in results
+    ):
+        return results
+    return None
+
+
+def _judge_panel_vote(ballot: list[bool]) -> tuple[bool | None, float, float]:
+    """Return the majority verdict, its score value, and the share of judges agreeing with it.
+
+    A tie is undecided: ``None``, worth 0.5, which favors neither side.
+    """
+    yes = sum(ballot)
+    share = max(yes, len(ballot) - yes) / len(ballot)
+    if yes * 2 == len(ballot):
+        return None, 0.5, share
+    verdict = yes * 2 > len(ballot)
+    return verdict, float(verdict), share
+
+
+def _judge_panel_member(
+    metric: str,
+    provider: str,
+    model: str,
+    result: Any,
+    aggregation: str,
+    expected_count: int | None,
+) -> dict[str, Any]:
+    """Build one member's panel entry; a result unusable for this aggregation becomes an error entry."""
+    identity = {"provider": provider, "model": model, "family": _model_family(provider, model)}
+
+    def failed(reason: Any) -> dict[str, Any]:
+        return {**identity, "status": "error", "reason": _judge_panel_text(reason) or "LLM judge failed"}
+
+    if not isinstance(result, dict):
+        return failed("Judge returned an invalid result")
+    if str(result.get("status", "")).casefold() == "error":
+        return failed(result.get("reason"))
+    score = result.get("score")
+    # The range check is False for NaN, so it also rejects non-finite scores.
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0.0 <= score <= 1.0:
+        return failed("Judge returned no finite score between 0 and 1")
+    entry = {
+        **identity,
+        "status": "ok",
+        "score": round(float(score), 4),
+        "reason": _judge_panel_text(result.get("reason")),
+    }
+    if metric == "accuracy":
+        criteria = result.get("criteria")
+        complete = (
+            isinstance(criteria, dict)
+            and set(criteria) == set(_JUDGE_PANEL_CRITERIA)
+            and all(isinstance(criteria[key], bool) for key in _JUDGE_PANEL_CRITERIA)
+        )
+        if aggregation == "vote" and not complete:
+            return failed("Judge returned incomplete accuracy criteria")
+        entry["criteria"] = {key: criteria[key] for key in _JUDGE_PANEL_CRITERIA} if complete else {}
+    elif metric == "behavior_check":
+        results = _judge_panel_behavior_results(result)
+        if results is None:
+            return failed("Judge returned malformed behavior results")
+        if expected_count is not None and len(results) != expected_count:
+            return failed(f"behavior result count {len(results)} does not match expected {expected_count}")
+        entry["results"] = [
+            {"step": index + 1, "passed": item["passed"], "reason": _judge_panel_text(item.get("reason"))}
+            for index, item in enumerate(results)
+        ]
+    else:
+        achieved = result.get("achieved")
+        if aggregation == "vote" and not isinstance(achieved, bool):
+            return failed("Judge returned no boolean achieved verdict")
+        entry["achieved"] = achieved if isinstance(achieved, bool) else None
+        entry["method"] = _judge_panel_text(result.get("method")) or "custom"
+    return entry
+
+
+def aggregate_panel(
+    metric: str,
+    member_results: list[tuple[str, str, Any]],
+    *,
+    aggregation: str = "vote",
+    quorum: int | None = None,
+    disagreement_threshold: float = DEFAULT_JUDGE_PANEL_DISAGREEMENT,
+    expected_count: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate one LLM metric's per-member results into a single result with a ``panel`` block.
+
+    ``member_results`` holds ``(provider, model, result)`` in panel order, where
+    ``result`` is a normalized judge result or a stored panel member entry.
+    ``vote`` takes the majority per accuracy criterion, per behavior, or on goal
+    ``achieved``; ``median`` and ``mean`` combine member scores. Fewer than
+    ``quorum`` usable members yields ``status="error"`` with ``score=None``,
+    never a zero score.
+    """
+    if metric not in _JUDGE_PANEL_METRICS:
+        raise ValueError(f"Unsupported judge panel metric: {metric!r}")
+    if aggregation not in JUDGE_PANEL_AGGREGATIONS:
+        raise ValueError(f"Unsupported judge panel aggregation: {aggregation!r}")
+    rows = list(member_results)
+    quorum = len(rows) // 2 + 1 if quorum is None else quorum
+
+    def entries(count: int | None) -> list[dict[str, Any]]:
+        return [
+            _judge_panel_member(metric, provider, model, result, aggregation, count) for provider, model, result in rows
+        ]
+
+    members = entries(expected_count)
+    if metric == "behavior_check" and expected_count is None:
+        # Stored entries may be re-aggregated without the behavior count; the most common length wins.
+        lengths = [len(member["results"]) for member in members if member["status"] == "ok"]
+        if lengths:
+            expected_count = max(lengths, key=lengths.count)
+            members = entries(expected_count)
+
+    ok = [member for member in members if member["status"] == "ok"]
+    scores = [member["score"] for member in ok]
+    # Structured verdicts are voted in every mode; median and mean report them for explainability only.
+    if metric == "accuracy":
+        voters = [member["criteria"] for member in ok if member["criteria"]]
+        ballots = [[voter[key] for voter in voters] for key in _JUDGE_PANEL_CRITERIA] if voters else []
+    elif metric == "behavior_check":
+        count = expected_count if ok and expected_count else 0
+        ballots = [[member["results"][index]["passed"] for member in ok] for index in range(count)]
+    else:
+        ballot = [member["achieved"] for member in ok if member["achieved"] is not None]
+        ballots = [ballot] if ballot else []
+    tallies = [_judge_panel_vote(ballot) for ballot in ballots]
+    voted_score = statistics.mean(value for _verdict, value, _share in tallies) if tallies else None
+    if metric == "accuracy":
+        fields: dict[str, Any] = {
+            "criteria": {key: tallies[index][0] for index, key in enumerate(_JUDGE_PANEL_CRITERIA)} if tallies else {}
+        }
+    elif metric == "behavior_check":
+        fields = {
+            "results": [
+                {
+                    "step": index + 1,
+                    "passed": verdict,
+                    "reason": f"{sum(ballots[index])}/{len(ballots[index])} judges observed this behavior",
+                }
+                for index, (verdict, _value, _share) in enumerate(tallies)
+            ]
+        }
+    else:
+        achieved = tallies[0][0] if tallies else None
+        fields = {"achieved": achieved, "method": "custom"}
+        if achieved is not None:
+            # The score follows the judges who carried the vote.
+            voted_score = statistics.median(member["score"] for member in ok if member["achieved"] is achieved)
+
+    failed_count = len(rows) - len(ok)
+    spread = round(max(scores) - min(scores), 4) if scores else None
+    shares = [share for _verdict, _value, share in tallies]
+    panel = {
+        "aggregation": aggregation,
+        "quorum": quorum,
+        "members": members,
+        "spread": spread,
+        "agreement": round(statistics.mean(shares), 4) if shares else None,
+        "disagreement": spread is not None and spread >= disagreement_threshold - 1e-9,
+        "disagreement_threshold": disagreement_threshold,
+        "failed_members": failed_count,
+    }
+    if len(ok) < max(quorum, 1):
+        error: dict[str, Any] = {
+            "score": None,
+            "status": "error",
+            "reason": (
+                f"Judge panel quorum not met for {metric}: {len(ok)}/{len(rows)} judges succeeded (quorum {quorum})"
+            ),
+        }
+        if metric == "behavior_check":
+            error["results"] = []
+        elif metric == "goal_accuracy":
+            error["method"] = "custom"
+        return {**error, "panel": panel}
+
+    if aggregation == "mean":
+        score = statistics.mean(scores)
+    elif aggregation == "median" or voted_score is None:
+        # A behavior check without behaviors has nothing to vote on.
+        score = statistics.median(scores)
+    else:
+        score = voted_score
+    failures = f"; {failed_count} failed" if failed_count else ""
+    return {
+        "score": round(score, 4),
+        "reason": f"panel {aggregation} ({len(ok)}/{len(rows)} judges{failures})",
+        **fields,
+        "panel": panel,
+    }
+
+
+# --- END SHARED JUDGE PANEL HELPERS ---
+
+
 # ── Public Provider Caller ───────────────────────────────────────────────────
 
 
@@ -2047,11 +2453,12 @@ def _urlopen_with_schema_fallback(build_request, *, target_key, use_schema, time
         raise
 
 
-def _call_anthropic(prompt, model, max_tokens, temperature, response_schema=None):
+def _call_anthropic(prompt, model, max_tokens, temperature, response_schema=None, request_url=None):
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         return None, "ANTHROPIC_API_KEY is required for the anthropic provider"
-    target_url = _anthropic_url()
+    # A judge panel member passes its own validated endpoint; the single judge resolves it here.
+    target_url = _anthropic_url() if request_url is None else request_url
     target_key = SchemaTargetKey(provider="anthropic", base_url=target_url, model=model)
     use_schema = response_schema is not None and target_key not in _SCHEMA_UNSUPPORTED_TARGETS
 
@@ -2076,7 +2483,7 @@ def _call_anthropic(prompt, model, max_tokens, temperature, response_schema=None
             },
         )
 
-    # _anthropic_url() validates the configured base URL before this request.
+    # _anthropic_url() or _judge_target_url() validated the base URL before this request.
     raw_response = _urlopen_with_schema_fallback(
         _build_request,
         target_key=target_key,
@@ -2244,6 +2651,144 @@ def _selected_judge_model(model=None):
     )
 
 
+def _post_chat_completion(
+    prompt,
+    *,
+    provider,
+    model,
+    api_key,
+    request_url,
+    max_tokens,
+    temperature,
+    response_schema,
+    schema_name,
+):
+    """POST one chat completion to an already validated URL and return the message content.
+
+    HTTP errors propagate so the caller can decide whether a fallback model applies.
+    """
+    target_key = SchemaTargetKey(provider=provider, base_url=request_url, model=model)
+    use_schema = response_schema is not None and target_key not in _SCHEMA_UNSUPPORTED_TARGETS
+
+    def _build_oai_request(include_schema):
+        return urllib.request.Request(
+            request_url,
+            data=json.dumps(
+                _chat_completion_payload(
+                    model,
+                    prompt,
+                    max_tokens,
+                    temperature,
+                    provider=provider,
+                    request_url=request_url,
+                    response_schema=response_schema if include_schema else None,
+                    schema_name=schema_name,
+                )
+            ).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+
+    raw_response = _urlopen_with_schema_fallback(
+        _build_oai_request,
+        target_key=target_key,
+        use_schema=use_schema,
+        timeout=90,
+    )
+    body = json.loads(raw_response)
+    choices = body.get("choices") or [{}]
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = first_choice.get("message")
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if content is None:
+        content = ""
+    return content
+
+
+# A judge panel member reads only its own provider's key; there is no cross-provider fallback.
+_JUDGE_TARGET_KEY_ENV = {
+    "nv_build": "NVIDIA_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openai-compatible": "SKILL_EVAL_LLM_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
+def _judge_target_url(provider):
+    """Resolve a judge panel member's endpoint from its own provider variable only.
+
+    Only the openai-compatible member reads SKILL_EVAL_LLM_BASE_URL, so a native
+    provider key is not sent to that gateway URL. The host delivers the primary
+    provider's endpoint in its native *_BASE_URL variable, and nv_build always
+    uses the official NVIDIA endpoint.
+    """
+    if provider == "nv_build":
+        return _validate_http_url(NVIDIA_BUILD_CHAT_URL)
+    if provider == "anthropic":
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+        root = (
+            _normalize_anthropic_base_url(base_url, "ANTHROPIC_BASE_URL") if base_url else "https://api.anthropic.com"
+        )
+        return _validate_http_url(root + "/v1/messages")
+    variable = "OPENAI_BASE_URL" if provider == "openai" else "SKILL_EVAL_LLM_BASE_URL"
+    base_url = os.environ.get(variable, "").strip()
+    if base_url:
+        return _validate_http_url(base_url.rstrip("/") + "/chat/completions")
+    if provider == "openai":
+        return _validate_http_url(OPENAI_CHAT_URL)
+    raise ValueError(f"No base URL configured for {provider} judge panel member ({variable})")
+
+
+def _call_judge_target(target, prompt, max_tokens, temperature, response_schema, schema_name):
+    """Call one judge panel member with only its own model, key, and endpoint.
+
+    Model overrides and fallback models never apply: a member that cannot reach
+    its configured model fails instead of silently changing the panel.
+    """
+    provider, model = target.provider, target.model
+    provenance = {"provider": provider, "model": model}
+    try:
+        if provider == "bedrock":
+            content, error = _call_bedrock(prompt, model, max_tokens, temperature)
+        else:
+            key_env = _JUDGE_TARGET_KEY_ENV.get(provider)
+            if key_env is None:
+                return None, f"Unsupported judge panel provider: {provider}", provenance
+            api_key = os.environ.get(key_env, "")
+            if not api_key.strip():
+                return None, f"No API key configured for {provider} judge panel member ({key_env})", provenance
+            request_url = _judge_target_url(provider)
+            if provider == "anthropic":
+                content, error = _call_anthropic(
+                    prompt,
+                    model,
+                    max_tokens,
+                    temperature,
+                    response_schema=response_schema,
+                    request_url=request_url,
+                )
+            else:
+                content = _post_chat_completion(
+                    prompt,
+                    provider=provider,
+                    model=model,
+                    api_key=api_key,
+                    request_url=request_url,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    response_schema=response_schema,
+                    schema_name=schema_name,
+                ).strip()
+                error = None
+        if error:
+            return None, _redact_configured_credentials(error), provenance
+        return content, None, provenance
+    except urllib.error.HTTPError as error:
+        return None, _format_http_error(error), provenance
+    except Exception as exc:
+        detail = f"Public provider call failed for {model}: {exc}"
+        return None, _redact_configured_credentials(detail), provenance
+
+
 def _call_public_llm_with_provenance(
     prompt,
     model=None,
@@ -2252,7 +2797,13 @@ def _call_public_llm_with_provenance(
     allow_model_fallback=True,
     response_schema=None,
     schema_name="judge_response",
+    target=None,
 ):
+    # A judge panel target, passed here or active in _ACTIVE_JUDGE_TARGET, fixes the
+    # provider, model, key, and endpoint. Without one the configured judge runs as before.
+    target = target if target is not None else _ACTIVE_JUDGE_TARGET.get()
+    if target is not None:
+        return _call_judge_target(target, prompt, max_tokens, temperature, response_schema, schema_name)
     provider = _public_provider()
     if not provider:
         return None, _public_provider_error(), {}
@@ -2289,47 +2840,18 @@ def _call_public_llm_with_provenance(
             if not api_key:
                 return None, f"No API key configured for {provider}", provenance
             request_url = _resolve_url(provider)
-            target_key = SchemaTargetKey(provider=provider, base_url=request_url, model=candidate_model)
-            use_schema = response_schema is not None and target_key not in _SCHEMA_UNSUPPORTED_TARGETS
-
-            def _build_oai_request(
-                include_schema,
-                *,
-                _url=request_url,
-                _model=candidate_model,
-                _key=api_key,
-            ):
-                return urllib.request.Request(
-                    _url,
-                    data=json.dumps(
-                        _chat_completion_payload(
-                            _model,
-                            prompt,
-                            max_tokens,
-                            temperature,
-                            provider=provider,
-                            request_url=_url,
-                            response_schema=response_schema if include_schema else None,
-                            schema_name=schema_name,
-                        )
-                    ).encode(),
-                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {_key}"},
-                )
-
             # request_url was validated by _resolve_url() before this request.
-            raw_response = _urlopen_with_schema_fallback(
-                _build_oai_request,
-                target_key=target_key,
-                use_schema=use_schema,
-                timeout=90,
+            content = _post_chat_completion(
+                prompt,
+                provider=provider,
+                model=candidate_model,
+                api_key=api_key,
+                request_url=request_url,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_schema=response_schema,
+                schema_name=schema_name,
             )
-            body = json.loads(raw_response)
-            choices = body.get("choices") or [{}]
-            first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
-            message = first_choice.get("message")
-            content = message.get("content", "") if isinstance(message, dict) else ""
-            if content is None:
-                content = ""
             if candidate_model != requested_model:
                 logger.warning("LLM judge model %s failed; using fallback model %s", requested_model, candidate_model)
             return content.strip(), None, provenance
@@ -2353,6 +2875,7 @@ def call_public_llm(
     allow_model_fallback=True,
     response_schema=None,
     schema_name="judge_response",
+    target=None,
 ):
     content, error, _provenance = _call_public_llm_with_provenance(
         prompt,
@@ -2362,6 +2885,7 @@ def call_public_llm(
         allow_model_fallback=allow_model_fallback,
         response_schema=response_schema,
         schema_name=schema_name,
+        target=target,
     )
     return content, error
 
@@ -8187,6 +8711,9 @@ def judge_goal_accuracy(question, ground_truth, agent_text, tool_summary=""):
 
 def _ragas_goal_accuracy_enabled():
     """RAGAS is an OpenAI-only optimization, never an agent-key fallback."""
+    # Every judge panel member runs the custom prompt so member verdicts stay comparable.
+    if _ACTIVE_JUDGE_TARGET.get() is not None or os.environ.get(JUDGE_PANEL_ENV, "").strip():
+        return False
     if _public_provider() != "openai":
         return False
     try:
@@ -8294,7 +8821,7 @@ Respond with ONLY a JSON object:
     if "score" in parsed:
         score = _finite_score(parsed["score"])
         assert score is not None
-    return {
+    result = {
         "score": score,
         "reason": _bounded_judge_text(parsed.get("reason", "")),
         "user_goal": _bounded_judge_text(parsed.get("user_goal", "")),
@@ -8302,6 +8829,10 @@ Respond with ONLY a JSON object:
         "method": "custom",
         **provenance,
     }
+    if _ACTIVE_JUDGE_TARGET.get() is not None:
+        # Panel members vote on ``achieved``; single-judge results keep their shape.
+        result["achieved"] = achieved
+    return result
 
 
 # ── LLM Judge: Behavior Check ────────────────────────────────────────────────
@@ -8502,6 +9033,67 @@ def _call_required_judge(metric, judge, *args, **kwargs):
     return _normalize_required_judge_result(metric, result)
 
 
+def _judge_panel_from_env():
+    """Return ``(panel, error)`` for the host-configured judge panel; both are None without one."""
+    try:
+        return parse_judge_panel_env(os.environ), None
+    except ValueError as exc:
+        return None, f"Invalid judge panel configuration: {exc}"
+
+
+def _call_metric_judges(
+    metric, judge, *args, panel=None, panel_error=None, skipped=False, expected_count=None, **kwargs
+):
+    """Score one LLM metric with the configured judge, or with every judge panel member.
+
+    Without a panel this is exactly one ``_call_required_judge`` call, and a
+    skipped metric returns its skip result without calling an LLM either way.
+    An invalid panel fails the metric closed rather than falling back to the
+    single judge. Panel members run sequentially, each under its own
+    required-judge deadline, and ``aggregate_panel`` combines their results.
+    """
+    if skipped or (panel is None and panel_error is None):
+        return _call_required_judge(metric, judge, *args, **kwargs)
+    if panel_error is not None:
+        return _judge_error(panel_error)
+
+    member_results = []
+    for target in panel.members:
+        token = _ACTIVE_JUDGE_TARGET.set(target)
+        try:
+            result = _call_required_judge(metric, judge, *args, **kwargs)
+        finally:
+            _ACTIVE_JUDGE_TARGET.reset(token)
+        # Redact before aggregate_panel bounds member text, so truncation cannot keep part of a credential.
+        member_results.append((target.provider, target.model, _sanitize_error_value(result)))
+    try:
+        aggregated = aggregate_panel(
+            metric,
+            member_results,
+            aggregation=panel.aggregation,
+            quorum=panel.quorum,
+            disagreement_threshold=panel.disagreement_threshold,
+            expected_count=expected_count,
+        )
+    except Exception as exc:
+        # Like a raising judge, a failed aggregation still writes fail-closed artifacts.
+        return _judge_error(f"Judge panel aggregation for {metric} raised {type(exc).__name__}: {exc}")
+    failed = aggregated.get("status") == "error"
+    if failed:
+        aggregated["reason"] = _judge_error(aggregated["reason"])["reason"]
+    logger.info(
+        "Judge panel %s (%s, quorum %d): %s -> %s",
+        metric,
+        panel.aggregation,
+        panel.quorum,
+        ", ".join(
+            f"{member['provider']}:{member['model']}={member['status']}" for member in aggregated["panel"]["members"]
+        ),
+        "quorum not met" if failed else f"score {aggregated['score']}",
+    )
+    return aggregated
+
+
 def _numeric_reward_payload(result, overall):
     payload = {}
     for key, value in result.items():
@@ -8632,35 +9224,51 @@ def main():
         traj, question, ground_truth=ground_truth, expected_behavior=expected_behavior
     )
 
+    # A host-configured judge panel scores each LLM metric with several judges.
+    panel, panel_error = _judge_panel_from_env()
+    if panel_error is not None:
+        logger.error("%s", _judge_error(panel_error)["reason"])
+
     # ── Eval 4: accuracy (LLM judge) ─────────────────────────────────────
-    acc_result = _call_required_judge(
+    acc_result = _call_metric_judges(
         "accuracy",
         judge_accuracy,
         question,
         ground_truth,
         bundles["accuracy"]["prompt_evidence"],
+        panel=panel,
+        panel_error=panel_error,
+        skipped=not ground_truth,
     )
     acc_score = acc_result["score"]
     details["accuracy"] = acc_result
 
     # ── Eval 5: goal_accuracy (RAGAS or custom LLM judge) ────────────────
-    ga_result = _call_required_judge(
+    ga_result = _call_metric_judges(
         "goal_accuracy",
         judge_goal_accuracy,
         question,
         ground_truth,
         bundles["goal_accuracy"]["prompt_evidence"],
         tool_summary="",
+        panel=panel,
+        panel_error=panel_error,
+        skipped=not ground_truth,
     )
     ga_score = ga_result["score"]
     details["goal_accuracy"] = ga_result
 
     # ── Eval 6: behavior_check (LLM judge) ───────────────────────────────
-    bc_result = _call_required_judge(
+    bc_result = _call_metric_judges(
         "behavior_check",
         judge_behavior_check,
         bundles["behavior_check"]["prompt_evidence"],
         expected_behavior,
+        panel=panel,
+        panel_error=panel_error,
+        skipped=not expected_behavior,
+        # Malformed entries keep today's judge behavior; the panel then infers the count from its members.
+        expected_count=len(expected_behavior) if isinstance(expected_behavior, list) else None,
     )
     bc_score = bc_result["score"]
     details["behavior_check"] = bc_result

@@ -322,6 +322,84 @@ def test_base_image_mode_defaults_to_self_contained_tasks(
     assert captured["emit"]["base_image"] == ""
 
 
+@pytest.mark.parametrize(
+    ("config", "expected_error"),
+    [
+        (
+            """\
+schema_version: 1
+harbor:
+  task_source: evals_json
+grading:
+  mode: default
+  judge_panel: openai:gpt-5.6-sol,anthropic:claude-opus-5
+""",
+            "unknown grading key(s): judge_panel",
+        ),
+        (
+            """\
+schema_version: 1
+harbor:
+  task_source: evals_json
+  judge_panel: openai:gpt-5.6-sol
+""",
+            "unknown harbor key(s): judge_panel",
+        ),
+        (
+            """\
+schema_version: 1
+judge_panel: openai:gpt-5.6-sol
+""",
+            "unknown top-level key(s): judge_panel",
+        ),
+    ],
+)
+def test_judge_panel_cannot_be_selected_from_skill_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config: str,
+    expected_error: str,
+) -> None:
+    """Judges are the evaluator's choice: evals/config.yml never selects or tunes the panel."""
+    result, captured = _run_engine(monkeypatch, tmp_path, config)
+
+    assert set(result) == {"error"}
+    (error,) = result["error"]
+    assert expected_error in error
+    assert captured["emit"] == {}
+    assert captured["pair"] == {}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "SKILL_EVAL_JUDGE_PANEL",
+        "SKILL_EVAL_JUDGE_PANEL_AGGREGATION",
+        "SKILL_EVAL_JUDGE_PANEL_QUORUM",
+        "SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT",
+        "SKILLEVALUATOR_JUDGE_PANEL__OPENAI_API_KEY",
+    ],
+)
+def test_judge_panel_runtime_env_from_skill_config_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    name: str,
+) -> None:
+    config = f"""\
+schema_version: 1
+harbor:
+  task_source: evals_json
+  runtime_env:
+    {name}: "1"
+"""
+    result, captured = _run_engine(monkeypatch, tmp_path, config)
+
+    assert set(result) == {"error"}
+    assert result["error"] == [f"harbor.runtime_env.{name} controls the host process and is not allowed"]
+    assert captured["emit"] == {}
+    assert captured["pair"] == {}
+
+
 def test_cli_grading_mode_accepts_legacy_aliases() -> None:
     assert GRADING_MODE_CHOICE.convert("aces_plus_custom", None, None) == "default_plus_custom"
     assert GRADING_MODE_CHOICE.convert("aces_default", None, None) == "default"

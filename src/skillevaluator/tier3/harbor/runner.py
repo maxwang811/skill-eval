@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -34,13 +35,18 @@ from skillevaluator.provider_config import (
     CHAT_DEFAULT_ANTHROPIC,
     CHAT_DEFAULT_NVIDIA,
     GATEWAY_AGENT_DEFAULT_MODELS,
+    JUDGE_PANEL_ENV,
+    JUDGE_PANEL_ENV_VARS,
+    JudgePanelConfig,
     ProviderConfig,
     ProviderConfigurationError,
     _normalize_anthropic_base_url,
+    resolve_judge_panel_config,
     resolve_llm_provider,
 )
 from skillevaluator.source_identity import normalized_evaluated_source
 from skillevaluator.tier3.evals_config import EvalsConfigError, load_evals_config
+from skillevaluator.tier3.harbor import DEFAULT_LLM_VERIFIER_TIMEOUT_SEC
 from skillevaluator.tier3.harbor.adapter import (
     _VERIFIER_BUDGET_ENV_VARS,
     _VERIFIER_JUDGE_MODEL_ENV_VARS,
@@ -280,6 +286,8 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
     )
     | _BEDROCK_HOST_ENV_VARS
     | _VERIFIER_JUDGE_MODEL_ENV_VARS
+    # Judges are the evaluator's choice; the SKILL_EVAL_ prefix also covers these.
+    | JUDGE_PANEL_ENV_VARS
     | frozenset().union(*_HARBOR_ENV_MODE_VARS.values())
 )
 _RUNTIME_ENV_HOST_CONTROL_PREFIXES = (
@@ -307,6 +315,35 @@ _OPERATOR_OWNED_AGENT_ENV = frozenset(
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
     }
+)
+# Harbor's installed agents read OPENAI_*, ANTHROPIC_*, and AWS_* from the
+# Harbor parent environment, so judge-only panel credentials live there only
+# under this private prefix, referenced solely by job-level verifier env.
+_JUDGE_PANEL_ALIAS_PREFIX = "SKILLEVALUATOR_JUDGE_PANEL__"
+_JUDGE_PANEL_NVIDIA_API_KEY_ALIAS = f"{_JUDGE_PANEL_ALIAS_PREFIX}NVIDIA_API_KEY"
+_JUDGE_PANEL_ENDPOINT_ENV_VARS = frozenset(
+    {
+        "ANTHROPIC_BASE_URL",
+        "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+        "AWS_REGION",
+        "OPENAI_BASE_URL",
+        "SKILL_EVAL_LLM_BASE_URL",
+    }
+)
+_JUDGE_PANEL_CLI_SOURCE = "--judge-panel"
+_OFFICIAL_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+_STANDARD_GRADER_LABEL = "standard grader"
+_CUSTOM_ONLY_PANEL_IGNORED = "custom_only grading runs no standard judges"
+_CATALOG_VERIFICATION_SEVERITY = {"verified": 0, "inconclusive": 1, "degraded": 2, "fatal": 3}
+# Harbor 0.13.2 defaults [verifier] and every [[steps]] verifier to 600 s; a
+# step uses its own value and never inherits the task-level one.
+_HARBOR_DEFAULT_VERIFIER_TIMEOUT_SEC = 600.0
+_MAX_STAGED_TASK_TOML_BYTES = 4 * 1024 * 1024
+_MAX_LISTED_VERIFIER_SHORTFALLS = 5
+_JUDGE_PANEL_STATISTICS_UNAVAILABLE = (
+    "Judge panel statistics are unavailable: no scored trial carried per-judge verdicts, so judge_panel.json and "
+    "the report's Judge Panel section were not produced. Native multi-step trials whose reward Harbor "
+    "aggregates at the trial root, and cases that skip every LLM metric, carry no per-judge verdicts."
 )
 
 
@@ -352,21 +389,34 @@ def _nvidia_build_key_handoff(
     *,
     env_mode: str,
 ) -> _NvidiaBuildKeyHandoff:
-    """Replace the host Build key with a stdin-backed sentinel."""
+    """Replace the host Build key with a stdin-backed sentinel.
+
+    A judge panel member's Build key arrives under its private panel alias
+    instead when nv_build is not the primary. A run carries at most one Build
+    key: a member key equal to the primary's is never aliased.
+    """
     subprocess_env = dict(run_env)
     subprocess_env.pop(_NVIDIA_BUILD_KEY_FILE_ENV, None)
     subprocess_env.pop(_NVIDIA_BUILD_KEY_STDIN_ENV, None)
+    sentinels = {_NVIDIA_BUILD_FILE_SENTINEL, _NVIDIA_BUILD_STDIN_SENTINEL}
+    stdin_key: str | None = None
     api_key = subprocess_env.get("NVIDIA_API_KEY", "")
     if (
         env_mode == "docker"
         and subprocess_env.get("SKILL_EVAL_LLM_PROVIDER") == "nv_build"
         and api_key
-        and api_key not in {_NVIDIA_BUILD_FILE_SENTINEL, _NVIDIA_BUILD_STDIN_SENTINEL}
+        and api_key not in sentinels
     ):
         subprocess_env["NVIDIA_API_KEY"] = _NVIDIA_BUILD_STDIN_SENTINEL
-        subprocess_env[_NVIDIA_BUILD_KEY_STDIN_ENV] = "1"
-        return _NvidiaBuildKeyHandoff(subprocess_env, api_key)
-    return _NvidiaBuildKeyHandoff(subprocess_env)
+        stdin_key = api_key
+    member_key = subprocess_env.get(_JUDGE_PANEL_NVIDIA_API_KEY_ALIAS, "")
+    if env_mode == "docker" and member_key and member_key not in sentinels and stdin_key in {None, member_key}:
+        subprocess_env[_JUDGE_PANEL_NVIDIA_API_KEY_ALIAS] = _NVIDIA_BUILD_STDIN_SENTINEL
+        stdin_key = member_key
+    if stdin_key is None:
+        return _NvidiaBuildKeyHandoff(subprocess_env)
+    subprocess_env[_NVIDIA_BUILD_KEY_STDIN_ENV] = "1"
+    return _NvidiaBuildKeyHandoff(subprocess_env, stdin_key)
 
 
 def build_harbor_run_command(
@@ -895,10 +945,28 @@ def _judge_model_config(
     provider: ProviderConfig,
     provider_env: Mapping[str, str],
     grading_mode: str,
-) -> dict[str, str | bool]:
+    panel: JudgePanelConfig | None = None,
+    *,
+    panel_source: str = JUDGE_PANEL_ENV,
+) -> dict[str, Any]:
     """Describe the configured standard-grading judge before any provider fallback."""
     if grading_mode == "custom_only":
+        if panel is not None:
+            return {"enabled": False, "panel_ignored": _CUSTOM_ONLY_PANEL_IGNORED}
         return {"enabled": False}
+    if panel is not None:
+        redacted = panel.redacted()
+        return {
+            "enabled": True,
+            "mode": "panel",
+            "panel": redacted["panel"],
+            "aggregation": redacted["aggregation"],
+            "quorum": redacted["quorum"],
+            "disagreement_threshold": redacted["disagreement_threshold"],
+            "source": panel_source,
+            "override_applied": True,
+            "warnings": redacted["warnings"],
+        }
     for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
         if model := provider_env.get(name):
             return {
@@ -948,6 +1016,257 @@ def _job_judge_subprocess_env(provider_env: Mapping[str, str], grading_mode: str
         return {}
     _source, value = selected
     return dict.fromkeys(_VERIFIER_JUDGE_MODEL_ENV_VARS, value)
+
+
+def _judge_panel_harbor_environment(
+    panel: JudgePanelConfig,
+    provider_env: Mapping[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Deliver panel settings and member credentials through Harbor's job-level verifier env.
+
+    Returns ``(subprocess_env_additions, job_verifier_env_additions)``. A member
+    credential the primary provider already delivers under the same name stays
+    on the existing task-level placeholder path (which also preserves the NVIDIA
+    Build stdin handoff). Every other value, including every member endpoint,
+    is staged in the Harbor parent only under a private
+    ``SKILLEVALUATOR_JUDGE_PANEL__`` alias, so Harbor's installed agents do not
+    read a judge-only key, and job-level ``--verifier-env``, the
+    highest-precedence verifier layer, maps the canonical name to that alias.
+    """
+    subprocess_env: dict[str, str] = {}
+    job_verifier_env: dict[str, str] = {}
+    for name, value in panel.verifier_settings().items():
+        subprocess_env[name] = value
+        job_verifier_env[name] = f"${{{name}}}"
+
+    credentials: dict[str, str] = {}
+    for member in panel.members:
+        member_environment = member.verifier_environment()
+        if member.provider == "anthropic":
+            # Pin the official endpoint explicitly; the job layer outranks task,
+            # step, and image values for the verifier's ANTHROPIC_BASE_URL.
+            member_environment.setdefault("ANTHROPIC_BASE_URL", _OFFICIAL_ANTHROPIC_BASE_URL)
+        elif member.provider == "bedrock":
+            member_environment.update(_selected_host_environment(_BEDROCK_HOST_ENV_VARS, os.environ))
+            # botocore then ignores AWS_ENDPOINT_URL* and shared-config endpoint_url values.
+            member_environment["AWS_IGNORE_CONFIGURED_ENDPOINT_URLS"] = "true"
+        credentials.update(member_environment)
+
+    for name, value in sorted(credentials.items()):
+        # Only credentials may reuse the primary's task-level delivery; endpoints
+        # are always pinned here so a task or step verifier env cannot move them.
+        if name not in _JUDGE_PANEL_ENDPOINT_ENV_VARS and provider_env.get(name) == value:
+            continue
+        alias = f"{_JUDGE_PANEL_ALIAS_PREFIX}{name}"
+        subprocess_env[alias] = value
+        job_verifier_env[name] = f"${{{alias}}}"
+    return subprocess_env, job_verifier_env
+
+
+def _judge_panel_secret_values(panel: JudgePanelConfig, subprocess_env: Mapping[str, str]) -> set[str]:
+    """Return every member credential the reporter must redact."""
+    return {member.api_key for member in panel.members if member.api_key} | secret_values_from_environment(
+        subprocess_env
+    )
+
+
+def _resolve_run_judge_panel(judge_panel: str | None) -> tuple[JudgePanelConfig | None, str]:
+    """Resolve the run's panel and name the input that supplied it.
+
+    ``judge_panel`` (``--judge-panel``) replaces ``SKILL_EVAL_JUDGE_PANEL``; an
+    explicit blank value opts out of the panel entirely, so the three panel
+    knobs it would have configured are ignored as well.
+    """
+    if judge_panel is None:
+        return resolve_judge_panel_config(os.environ), JUDGE_PANEL_ENV
+    if not judge_panel.strip():
+        return None, _JUDGE_PANEL_CLI_SOURCE
+    environ = {**os.environ, JUDGE_PANEL_ENV: judge_panel}
+    return resolve_judge_panel_config(environ, source=_JUDGE_PANEL_CLI_SOURCE), _JUDGE_PANEL_CLI_SOURCE
+
+
+def _skill_selected_custom_grader_error(panel_source: str, config_file: str) -> str:
+    """Explain why a panel run refuses a custom grader the skill selected for itself."""
+    if panel_source == JUDGE_PANEL_ENV:
+        without_panel = f"unset {JUDGE_PANEL_ENV} (or pass {_JUDGE_PANEL_CLI_SOURCE} '')"
+    else:
+        without_panel = f"pass {_JUDGE_PANEL_CLI_SOURCE} ''"
+    return (
+        f"The skill's {config_file} selects grading.mode default_plus_custom, so its custom grader would run "
+        "in the verifier with every judge panel member's credential in its environment. Pass --grading-mode "
+        "default_plus_custom to accept that exposure (use dedicated, spend-capped judge keys), --grading-mode "
+        f"default to skip the custom grader, or {without_panel} to run without the panel."
+    )
+
+
+def _judge_panel_agent_route_warnings(
+    panel: JudgePanelConfig,
+    provider: ProviderConfig,
+    agents: list[str],
+) -> list[str]:
+    """Flag a member credential that also selects an agent's own credential route.
+
+    With an ``openai-compatible`` primary, a host ``ANTHROPIC_API_KEY`` moves
+    claude-code from the gateway to its independent Claude route. Routing is
+    left as it is; the warning tells the operator the key now serves both.
+    """
+    anthropic_members = [member.label for member in panel.members if member.provider == "anthropic"]
+    if (
+        provider.provider != "openai-compatible"
+        or "claude-code" not in agents
+        or not anthropic_members
+        or not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    ):
+        return []
+    members = f"member{'s' if len(anthropic_members) > 1 else ''} {', '.join(anthropic_members)}"
+    return [
+        f"ANTHROPIC_API_KEY, used by judge panel {members}, also selects claude-code's independent Claude "
+        "route: claude-code runs with that key against ANTHROPIC_BASE_URL or, when it is unset, the native "
+        f"Anthropic API (default model {CHAT_DEFAULT_ANTHROPIC}) instead of the openai-compatible gateway. To keep "
+        "claude-code on the gateway, unset ANTHROPIC_API_KEY and judge Claude through a bedrock or "
+        "openai-compatible member."
+    ]
+
+
+def _judge_panel_progress_event(
+    panel: JudgePanelConfig,
+    grading_mode: str,
+    warnings: list[str] | tuple[str, ...] = (),
+) -> ProgressEvent:
+    """Summarize the configured panel and its current warnings as a non-fatal progress detail."""
+    if grading_mode == "custom_only":
+        return ProgressEvent(stage="judge-panel", state="skipped", detail=_CUSTOM_ONLY_PANEL_IGNORED)
+    summary = (
+        f"{len(panel.members)} judge(s): {panel.env_value()}; {panel.aggregation} aggregation, quorum {panel.quorum}"
+    )
+    if warnings:
+        return ProgressEvent(stage="judge-panel", state="degraded", detail="; ".join((summary, *warnings)))
+    return ProgressEvent(stage="judge-panel", state="ready", detail=summary)
+
+
+def _record_judge_catalog_verification(
+    judge_config: dict[str, Any],
+    selected_labels: list[str],
+    status: str,
+) -> None:
+    """Record a catalog probe outcome on the standard grader or each panel member it covers."""
+    if _STANDARD_GRADER_LABEL in selected_labels:
+        judge_config["catalog_verification"] = status
+    for member in judge_config.get("panel", ()):
+        if f"{_STANDARD_GRADER_LABEL}: {member['label']}" in selected_labels:
+            member["catalog_verification"] = status
+
+
+def _worst_catalog_verification(statuses: list[str]) -> str:
+    return max(statuses, key=lambda status: _CATALOG_VERIFICATION_SEVERITY.get(status, 2))
+
+
+def _staged_task_config(task_file: Path) -> dict[str, Any] | None:
+    """Parse one staged ``task.toml`` within a size bound; ``None`` when it cannot be checked."""
+    try:
+        if not stat.S_ISREG(task_file.lstat().st_mode):
+            return None
+        with task_file.open("rb") as handle:
+            payload = handle.read(_MAX_STAGED_TASK_TOML_BYTES + 1)
+    except OSError:
+        return None
+    if len(payload) > _MAX_STAGED_TASK_TOML_BYTES:
+        return None
+    try:
+        return tomllib.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError):
+        return None
+
+
+def _harbor_verifier_timeouts(config: Mapping[str, Any]) -> list[tuple[str | None, float]]:
+    """Return ``(step name or None, timeout)`` for each verifier run Harbor 0.13.2 times out."""
+
+    def configured(table: object) -> float | None:
+        value = table.get("timeout_sec") if isinstance(table, dict) else None
+        if value is None:
+            return _HARBOR_DEFAULT_VERIFIER_TIMEOUT_SEC
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            return None
+        return float(value)
+
+    steps = config.get("steps")
+    if not isinstance(steps, list) or not steps:
+        timeout_sec = configured(config.get("verifier"))
+        return [] if timeout_sec is None else [(None, timeout_sec)]
+    timeouts: list[tuple[str | None, float]] = []
+    for position, step in enumerate(steps, start=1):
+        table = step if isinstance(step, dict) else {}
+        name = table.get("name")
+        timeout_sec = configured(table.get("verifier"))
+        if timeout_sec is not None:
+            timeouts.append((name[:64] if isinstance(name, str) and name else f"#{position}", timeout_sec))
+    return timeouts
+
+
+def _native_verifier_budget_warnings(
+    task_roots: list[Path],
+    *,
+    member_count: int,
+    timeout_multiplier: float,
+) -> list[str]:
+    """Warn when a staged native task's verifier budget cannot fit the panel's sequential judges.
+
+    Staging keeps author-specified timeouts as written, so the operator is told
+    which tasks fall short and how to raise their budget before any trial runs.
+    """
+    required_sec = DEFAULT_LLM_VERIFIER_TIMEOUT_SEC * member_count
+    # Authored timeouts by location; Harbor multiplies each by timeout_multiplier.
+    shortfalls: dict[str, float] = {}
+    for root in task_roots:
+        for task_file in sorted(root.glob("*/task.toml")):
+            config = _staged_task_config(task_file)
+            if config is None:
+                continue
+            for step, timeout_sec in _harbor_verifier_timeouts(config):
+                if timeout_sec * timeout_multiplier < required_sec:
+                    case = task_file.parent.name
+                    shortfalls[case if step is None else f"{case} step {step!r}"] = timeout_sec
+    if not shortfalls:
+        return []
+
+    listed = [
+        f"{location} ({timeout_sec * timeout_multiplier:g}s)" for location, timeout_sec in sorted(shortfalls.items())
+    ]
+    if len(listed) > _MAX_LISTED_VERIFIER_SHORTFALLS:
+        hidden = len(listed) - _MAX_LISTED_VERIFIER_SHORTFALLS
+        listed = [*listed[:_MAX_LISTED_VERIFIER_SHORTFALLS], f"{hidden} more"]
+    remedies = ["raise [verifier] or [steps.verifier] timeout_sec"]
+    if timeout_multiplier > 0:
+        remedies[0] += f" to at least {required_sec / timeout_multiplier:g}s"
+    shortest_sec = min(shortfalls.values())
+    if shortest_sec > 0:
+        # Round up to two decimals without letting float noise add a step.
+        multiplier = math.ceil(round(required_sec / shortest_sec * 100, 6)) / 100
+        remedies.append(f"pass --timeout-multiplier {multiplier:g} (it also scales agent timeouts)")
+    return [
+        f"Native task verifier timeouts are below the judge panel's {required_sec:g}s budget "
+        f"({member_count} judges x {DEFAULT_LLM_VERIFIER_TIMEOUT_SEC:g}s): {', '.join(listed)}. A verifier "
+        f"timeout fails the whole trial; {', or '.join(remedies)}."
+    ]
+
+
+def _judge_panel_statistics_warning(results: Mapping[str, Any]) -> str | None:
+    """Explain a panel run whose scored trials produced no judge-panel statistics."""
+    agents = results.get("agents")
+    agent_results = [agent for agent in agents.values() if isinstance(agent, dict)] if isinstance(agents, dict) else []
+    if any(agent.get("judge_panel") for agent in agent_results):
+        return None
+    # The collector computes panel statistics only from succeeded conditions.
+    scored = any(
+        isinstance(condition, dict)
+        and condition.get("execution_status") == "succeeded"
+        and isinstance(condition.get("scored_attempts"), int)
+        and condition["scored_attempts"] > 0
+        for agent in agent_results
+        if isinstance(agent.get("conditions"), dict)
+        for condition in agent["conditions"].values()
+    )
+    return _JUDGE_PANEL_STATISTICS_UNAVAILABLE if scored else None
 
 
 def _agent_credentials(
@@ -1853,10 +2172,15 @@ def _run_harbor_eval_impl(
     override_storage_mb: int | None = None,
     evaluated_source: dict[str, str] | None = None,
     progress_reporter: ProgressReporter | None = None,
+    judge_panel: str | None = None,
     _evaluator_skill_path: Path | None = None,
     _monotonic_start: float | None = None,
 ) -> dict[str, Any]:
-    """Run a public Harbor evaluation with and without the target skill."""
+    """Run a public Harbor evaluation with and without the target skill.
+
+    ``judge_panel`` (``--judge-panel``) replaces the host ``SKILL_EVAL_JUDGE_PANEL``
+    value; the panel is never read from skill-owned configuration.
+    """
     forwarded = dict(locals()) if _evaluator_skill_path is None else None
     started_at = _monotonic_start if _monotonic_start is not None else time.monotonic()
     reporter = safe_progress_reporter(progress_reporter or NullProgressReporter())
@@ -1893,6 +2217,7 @@ def _run_harbor_eval_impl(
 
     try:
         provider = resolve_llm_provider()
+        judge_panel_config, judge_panel_source = _resolve_run_judge_panel(judge_panel)
         config, config_path = load_evals_config(evaluator_skill_path)
     except (ProviderConfigurationError, EvalsConfigError) as exc:
         reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
@@ -1914,6 +2239,7 @@ def _run_harbor_eval_impl(
         if agent_runtime_preflight is not None
         else harbor_config.get("agent_runtime_preflight", False)
     )
+    grading_mode_from_operator = bool(grading_mode)
     grading_mode = grading_mode or grading_config.get("mode", "default")
     workspace_mode = skill_workspace_mode or workspace_config.get("mode", "isolated")
     dockerfile_mode = custom_dockerfile_mode or harbor_config.get("custom_dockerfile_mode", "rebase")
@@ -1940,11 +2266,28 @@ def _run_harbor_eval_impl(
     if grading_mode not in {"default", "default_plus_custom", "custom_only"}:
         reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid grading mode"))
         return {"error": ["grading.mode must be default, default_plus_custom, or custom_only"]}
+    if judge_panel_config is not None and grading_mode == "default_plus_custom" and not grading_mode_from_operator:
+        # The custom grader shares the verifier environment that holds every
+        # member credential, so only the operator can opt into that exposure.
+        config_file = config_path.relative_to(evaluator_skill_path).as_posix() if config_path else "evals/config.yml"
+        detail = _skill_selected_custom_grader_error(judge_panel_source, config_file)
+        reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=detail))
+        return {"error": [detail]}
     if workspace_mode not in {"isolated", "group"}:
         reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="invalid workspace mode"))
         return {"error": ["skill_workspace.mode must be isolated or group"]}
 
     reporter.emit(ProgressEvent(stage="configuration", state="ready", detail="evaluation config validated"))
+    # custom_only grading runs no standard judges: no member probes, env, or timeout scaling.
+    active_judge_panel = judge_panel_config if grading_mode != "custom_only" else None
+    judge_panel_warnings: list[str] = []
+    # Warnings only the engine can find; the CLI prints the panel's own warnings before the run.
+    judge_panel_run_warnings: list[str] = []
+    if active_judge_panel is not None:
+        judge_panel_run_warnings = _judge_panel_agent_route_warnings(active_judge_panel, provider, agents)
+        judge_panel_warnings = [*active_judge_panel.warnings, *judge_panel_run_warnings]
+    if judge_panel_config is not None:
+        reporter.emit(_judge_panel_progress_event(judge_panel_config, grading_mode, judge_panel_warnings))
     reporter.emit(ProgressEvent(stage="model-resolution", state="running"))
 
     agent_models_config = harbor_config.get("agents", {})
@@ -1964,7 +2307,19 @@ def _run_harbor_eval_impl(
 
     provider_env = _provider_environment(provider)
     configured_runtime_env, runtime_errors = _resolve_runtime_env(harbor_config.get("runtime_env"))
-    reporter.set_secret_values(secret_values_from_environment(provider_env) | set(configured_runtime_env.values()))
+    if active_judge_panel is None:
+        panel_subprocess_env: dict[str, str] = {}
+        panel_job_verifier_env: dict[str, str] = {}
+        panel_secret_values: set[str] = set()
+    else:
+        panel_subprocess_env, panel_job_verifier_env = _judge_panel_harbor_environment(
+            active_judge_panel,
+            provider_env,
+        )
+        panel_secret_values = _judge_panel_secret_values(active_judge_panel, panel_subprocess_env)
+    reporter.set_secret_values(
+        secret_values_from_environment(provider_env) | set(configured_runtime_env.values()) | panel_secret_values
+    )
     reporter.emit(ProgressEvent(stage="model-resolution", state="complete", detail="agent models resolved"))
     reporter.start(
         Tier3RunPlan(
@@ -2029,6 +2384,7 @@ def _run_harbor_eval_impl(
     runtime_secret_values = set().union(
         *(secret_values_from_environment(plan.subprocess_env) for plan in runtime_plans.values())
     )
+    runtime_secret_values.update(panel_secret_values)
 
     # Probe each exact agent route before reserving output space, building images,
     # or staging tasks. The runtime-preflight module imports runner helpers, so
@@ -2045,7 +2401,15 @@ def _run_harbor_eval_impl(
     ] = {}
     probe_degraded: list[str] = []
     credential_validation_targets: list[dict[str, Any]] = []
-    judge_config = _judge_model_config(provider, provider_env, grading_mode)
+    judge_config = _judge_model_config(
+        provider,
+        provider_env,
+        grading_mode,
+        judge_panel_config,
+        panel_source=judge_panel_source,
+    )
+    if active_judge_panel is not None:
+        judge_config["warnings"] = list(judge_panel_warnings)
 
     def add_probe_target(label: str, selected_provider: ProviderConfig) -> None:
         route_key = (
@@ -2065,7 +2429,12 @@ def _run_harbor_eval_impl(
         add_probe_target(agent, runtime_plans[agent].provider)
 
     if grading_mode != "custom_only":
-        if task_source == "native_harbor" and not bool(judge_config["override_applied"]):
+        if active_judge_panel is not None:
+            # Panel members name their models explicitly, so each exact route is
+            # probed (FATAL blocks, DEGRADED continues) even for native tasks.
+            for member in active_judge_panel.members:
+                add_probe_target(f"{_STANDARD_GRADER_LABEL}: {member.label}", member.provider_config())
+        elif task_source == "native_harbor" and not bool(judge_config["override_applied"]):
             detail = (
                 "native Harbor resolves the effective judge model at runtime; "
                 "task or step verifier env may supersede the configured fallback"
@@ -2129,8 +2498,7 @@ def _run_harbor_eval_impl(
                     "detail": safe_detail,
                 }
             )
-            if "standard grader" in selected_labels:
-                judge_config["catalog_verification"] = "degraded"
+            _record_judge_catalog_verification(judge_config, selected_labels, "degraded")
             continue
 
         safe_detail = redact_progress_detail(probe.detail, secret_values=runtime_secret_values)
@@ -2146,12 +2514,15 @@ def _run_harbor_eval_impl(
                 "detail": safe_detail,
             }
         )
-        if "standard grader" in selected_labels:
-            judge_config["catalog_verification"] = disposition.value
+        _record_judge_catalog_verification(judge_config, selected_labels, disposition.value)
         if disposition == CredentialProbeDisposition.FATAL:
             probe_errors.append(f"{label} provider verification failed: {safe_detail}")
         elif disposition == CredentialProbeDisposition.DEGRADED:
             probe_degraded.append(f"{label}: {safe_detail}")
+    if active_judge_panel is not None:
+        judge_config["catalog_verification"] = _worst_catalog_verification(
+            [str(member.get("catalog_verification", "degraded")) for member in judge_config["panel"]]
+        )
 
     if probe_errors:
         reporter.emit(
@@ -2209,6 +2580,10 @@ def _run_harbor_eval_impl(
     staged_verifier_env = {name: f"${{{name}}}" for name in verifier_env if name not in _VERIFIER_JUDGE_MODEL_ENV_VARS}
     job_judge_verifier_env = _job_judge_verifier_env(provider_env, grading_mode)
     job_judge_subprocess_env = _job_judge_subprocess_env(provider_env, grading_mode)
+    # Panel members run sequentially in the verifier, so its budget scales with N.
+    verifier_timeout_sec = (
+        DEFAULT_LLM_VERIFIER_TIMEOUT_SEC * len(active_judge_panel.members) if active_judge_panel is not None else None
+    )
 
     include_values = [*workspace_config.get("include", []), *(include_skills or [])]
     if include_values and workspace_mode != "group":
@@ -2361,6 +2736,7 @@ def _run_harbor_eval_impl(
                 repo_context_exclude_paths=(root,),
                 runtime_env=dict(runtime_plans[agent].staged_env),
                 verifier_env=staged_verifier_env,
+                verifier_timeout_sec=verifier_timeout_sec,
                 pre_agent_setup=harbor_config.get("pre_agent_setup", []),
                 task_resources=resource_config,
                 agent_workdir=harbor_config.get("agent_workdir"),
@@ -2401,6 +2777,7 @@ def _run_harbor_eval_impl(
                     repo_context_exclude_paths=(root,),
                     runtime_env=dict(runtime_plans[agent].staged_env),
                     verifier_env=staged_verifier_env,
+                    verifier_timeout_sec=verifier_timeout_sec,
                     pre_agent_setup=harbor_config.get("pre_agent_setup", []),
                     task_resources=resource_config,
                     agent_workdir=harbor_config.get("agent_workdir"),
@@ -2414,6 +2791,17 @@ def _run_harbor_eval_impl(
     except (OSError, ValueError) as exc:
         reporter.emit(ProgressEvent(stage=staging_failure_stage, state="failed", detail=str(exc)))
         return _persist_pre_execution_failure([str(exc)])
+
+    if active_judge_panel is not None and task_source == "native_harbor":
+        budget_warnings = _native_verifier_budget_warnings(
+            [root for roots in agent_task_dirs.values() for root in roots if root is not None],
+            member_count=len(active_judge_panel.members),
+            timeout_multiplier=float(timeout_multiplier),
+        )
+        if budget_warnings:
+            judge_config["warnings"].extend(budget_warnings)
+            judge_panel_run_warnings.extend(budget_warnings)
+            reporter.emit(_judge_panel_progress_event(active_judge_panel, grading_mode, judge_config["warnings"]))
 
     task_names = expected_task_names or []
     expected_trials = len(task_names) * n_attempts
@@ -2512,7 +2900,7 @@ def _run_harbor_eval_impl(
             with_skill=agent_task_dirs[agent][0],
             baseline=agent_task_dirs[agent][1],
             jobs_dir=jobs_dir,
-            run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env},
+            run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env, **panel_subprocess_env},
             n_attempts=n_attempts,
             n_concurrent=n_concurrent,
             timeout_multiplier=float(timeout_multiplier),
@@ -2524,7 +2912,7 @@ def _run_harbor_eval_impl(
             stop_on_pass=bool(stop_on_pass),
             pass_threshold=float(pass_threshold),
             task_names=task_names,
-            verifier_env=job_judge_verifier_env,
+            verifier_env={**job_judge_verifier_env, **panel_job_verifier_env},
         )
 
     active_agents: set[str] = set()
@@ -2605,6 +2993,12 @@ def _run_harbor_eval_impl(
         _emit_run_finished("failed", "result collection failed")
         raise
     reporter.emit(ProgressEvent(stage="collection", state="complete", detail="Harbor results collected"))
+    if active_judge_panel is not None:
+        # The run summary shows these whatever the progress mode; the progress line alone is easy to miss.
+        if judge_panel_run_warnings:
+            results.setdefault("warnings", []).extend(judge_panel_run_warnings)
+        if statistics_warning := _judge_panel_statistics_warning(results):
+            results.setdefault("warnings", []).append(statistics_warning)
     dataset_truth = _persist_dataset_truth(run_dir, fallback_task_ids=task_names)
     results.update(
         {

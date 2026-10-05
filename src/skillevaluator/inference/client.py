@@ -305,7 +305,12 @@ class LLMClient:
         retry_base_delay: float | None = None,
         retry_max_delay: float | None = None,
         http_client: Any = None,
+        provider_config: ProviderConfig | None = None,
     ) -> None:
+        # An explicit provider_config (e.g. one judge panel member) replaces
+        # environment resolution, so it must also be the only endpoint source.
+        if provider_config is not None and (model or base_url or api_key):
+            raise ValueError("Pass model, base_url, and api_key through provider_config, not alongside it.")
         self._model = model
         self._base_url = base_url
         self._api_key = api_key
@@ -319,7 +324,7 @@ class LLMClient:
         )
         self._http_client = http_client
         self._client: Any = None
-        self._provider_config: ProviderConfig | None = None
+        self._provider_config: ProviderConfig | None = provider_config
 
     # -- public read-only properties for introspection --------------------
 

@@ -79,7 +79,10 @@ skillevaluator tier3 evaluate ./my-skill --agents codex --grading-mode default_p
 ```
 
 With `evals/config.yml` in place from step 1, the `--grading-mode` flag is
-optional — the config already selects it.
+optional — the config already selects it. With a
+[judge panel](tier3-live-evaluation.mdx#cross-model-judging), pass the flag
+anyway: a panel run refuses a `default_plus_custom` mode that only the
+skill's config selects.
 
 </Steps>
 
@@ -132,6 +135,21 @@ a standardized JSON trajectory:
 | `HARBOR_LOGS_DIR` | `/logs` | Root of the log tree |
 | `HARBOR_TESTS_DIR` | `/tests` | Root of the staged test files |
 | `HARBOR_GRADER` | `/tests/grader.py` | Where your staged grader runs from |
+
+In `default_plus_custom` mode, the grader runs right after the standard
+verifier in the same verifier environment, so it can read the credentials
+delivered for standard grading: the primary judge key and, with a
+[judge panel](tier3-live-evaluation.mdx#cross-model-judging), every member's
+key. A member's variables can replace the primary provider's values under the
+same name. For example, a native `openai` member supplies `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` even when the primary is an `openai-compatible` gateway.
+
+A skill can select this mode itself in its `evals/config.yml`, so with a judge
+panel that choice alone is refused at configuration time. Pass
+`--grading-mode default_plus_custom` to accept the exposure, ideally with
+dedicated, spend-capped judge keys, or `--grading-mode default` to skip the
+custom grader. See
+[Judge keys and the evaluated skill](configuration.mdx#judge-keys-and-the-evaluated-skill).
 
 ## Bring your own task (BYOT)
 
@@ -186,6 +204,14 @@ Two rules keep BYOT predictable:
 - **Your source is never mutated in place.** SkillEvaluator stages with-skill
   and baseline copies of `evals/harbor/` under the results directory for each
   run; the files you author stay untouched.
+
+With a [judge panel](tier3-live-evaluation.mdx#cross-model-judging), every
+verifier pass must stay in the shared agent container: staging fails before
+Harbor starts when a task sets `[verifier] environment_mode` to anything other
+than `"shared"` or declares a `[verifier.environment]` table, at task level or
+under `[[steps]]`. The scaffold's `[verifier] timeout_sec = 600.0` also does
+not grow with the panel; see
+[Cost and timeouts](tier3-live-evaluation.mdx#cost-and-timeouts).
 
 ## Validate the contract
 

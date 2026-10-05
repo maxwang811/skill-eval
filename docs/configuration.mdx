@@ -297,6 +297,198 @@ Names that control the launcher, credentials, or dynamic runtime are rejected:
 
 Configure the selected Harbor backend in the host environment instead.
 
+## Cross-model judge panel
+
+Tier 3 standard grading scores three metrics with an LLM judge: `accuracy`,
+`goal_accuracy`, and `behavior_check`. By default one judge does this — the
+selected provider with its judge model. A judge panel scores those metrics with
+up to five `provider:model` judges instead, ideally from different model
+families, and aggregates their verdicts. The panel is off by default. What it
+measures and costs is covered in
+[Tier 3: Live Evaluation](tier3-live-evaluation.mdx#cross-model-judging); how
+to read its results is in [Reports & Results](reports.mdx#judge-panel).
+
+```bash title="A three-judge panel"
+export SKILL_EVAL_LLM_PROVIDER=nv_build   # primary provider; required with several keys
+export NVIDIA_API_KEY='nvapi-...'
+export OPENAI_API_KEY='sk-...'            # openai member
+export ANTHROPIC_API_KEY='sk-ant-...'     # anthropic member
+export SKILL_EVAL_JUDGE_PANEL='openai:gpt-5.6-sol,anthropic:claude-opus-5,nv_build:nvidia/nemotron-3-super-120b-a12b'
+```
+
+| Variable | Default | Accepted values |
+| --- | --- | --- |
+| `SKILL_EVAL_JUDGE_PANEL` | unset (one judge) | 1 to 5 comma-separated `provider:model` entries. Providers are the `SKILL_EVAL_LLM_PROVIDER` values. Each entry splits at its first colon, so a model ID keeps its own colons (for example, a Bedrock ID ending in `-v1:0`). Duplicate entries are rejected, and a blank value means unset. |
+| `SKILL_EVAL_JUDGE_PANEL_AGGREGATION` | `vote` | `vote`, `median`, or `mean`, case-insensitive |
+| `SKILL_EVAL_JUDGE_PANEL_QUORUM` | a majority, `floor(N/2) + 1` | An integer from 1 to the member count N |
+| `SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT` | `0.4` | A number from 0 to 1. A metric whose judge scores span at least this much is flagged for review. |
+
+`--judge-panel` on `tier3 evaluate`, `tier3 PATH`, and `validate` replaces
+`SKILL_EVAL_JUDGE_PANEL` for one run; the other three settings still come from
+the environment. `--judge-panel ''` turns the panel off for that run: the
+single standard judge scores it, and the other three settings are ignored, as
+is the judge-model conflict below. The configuration is validated before
+Harbor starts, and the panel itself is checked before `--autopilot`,
+`tier3 PATH`, or `validate` generates a starter case:
+
+- Setting the aggregation, quorum, or disagreement variable without a panel is
+  an error, not a silent single-judge run. An empty `SKILL_EVAL_JUDGE_PANEL`
+  counts as no panel here; only `--judge-panel ''` opts out while those
+  variables are set.
+- The panel cannot be combined with `LLM_JUDGE_MODEL` or
+  `SKILL_EVAL_JUDGE_MODEL`. The panel names each judge's model explicitly, so
+  unset those overrides or remove the panel.
+- An `openai-compatible` member cannot be combined with an `openai` or
+  `anthropic` primary, as explained under
+  [Member credentials](#member-credentials).
+- A `default_plus_custom` grading mode that only the skill's `evals/config.yml`
+  selects is refused, as explained under
+  [Judge keys and the evaluated skill](#judge-keys-and-the-evaluated-skill).
+- An even member count with `vote` aggregation is accepted with a warning that
+  recommends an odd count, because a tied verdict counts as 0.5.
+  `tier3 evaluate` and `tier3 PATH` print it to standard error before the run
+  starts, `validate` shows it as a `judge panel` row in its Tier 3 section (or
+  on standard error with `--verbose`), and `doctor` shows it on its
+  **Judge panel** row.
+- `custom_only` grading runs no standard judge, so the panel is validated but
+  not used: no member is probed, and no member credential is delivered.
+
+When `--judge-panel` supplied the panel, errors about it name the flag instead
+of `SKILL_EVAL_JUDGE_PANEL`.
+
+### Member credentials
+
+Each member authenticates with its provider's standard credential variables —
+the same ones that provider uses as the primary:
+
+| Member provider | Credential | Endpoint |
+| --- | --- | --- |
+| `openai` | `OPENAI_API_KEY` | `OPENAI_BASE_URL`, else `https://api.openai.com/v1`. With an `openai` primary, the primary's endpoint, so `SKILL_EVAL_LLM_BASE_URL` comes first. |
+| `anthropic` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`, else the Anthropic default. With an `anthropic` primary, the primary's endpoint, so `SKILL_EVAL_LLM_BASE_URL` comes first. |
+| `nv_build` | `NVIDIA_API_KEY` | Always `https://integrate.api.nvidia.com/v1` |
+| `bedrock` | The standard AWS credential chain | `AWS_REGION`, default `us-west-2` |
+| `openai-compatible` | `SKILL_EVAL_LLM_API_KEY` | `SKILL_EVAL_LLM_BASE_URL`, required. Not allowed with an `openai` or `anthropic` primary. |
+
+A missing member credential fails the run before Harbor starts, naming the
+member and the variable; SkillEvaluator never falls back to fewer judges. Only
+a member whose provider is the primary `SKILL_EVAL_LLM_PROVIDER` shares the
+primary's endpoint, including a `SKILL_EVAL_LLM_BASE_URL` override; every other
+member reads its own provider's endpoint variable or uses the official
+endpoint. `SKILL_EVAL_LLM_BASE_URL` and `SKILL_EVAL_LLM_API_KEY` describe a
+single gateway, so `openai-compatible` may appear in the panel at most once.
+
+Because `SKILL_EVAL_LLM_BASE_URL` is also the endpoint override of an `openai`
+or `anthropic` primary, an `openai-compatible` member cannot join a panel with
+either primary: the gateway URL would become the primary's endpoint too, so
+the native key would be sent to the gateway, starting with the catalog probe.
+Such a panel fails before any probe, including when the primary is
+auto-selected from a lone `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. Select the
+gateway as the primary (`SKILL_EVAL_LLM_PROVIDER=openai-compatible`) and list
+`openai:MODEL` or `anthropic:MODEL` as a member, or remove the
+`openai-compatible` member. `nv_build`, `bedrock`, and `openai-compatible`
+primaries accept a gateway member.
+
+`SKILL_EVAL_LLM_PROVIDER` still selects the primary provider, which drives
+agent selection, dataset generation, and the report's improvement suggestions.
+The primary does not join the panel automatically; list it as a member if it
+should judge. Exporting several provider keys makes `SKILL_EVAL_LLM_PROVIDER`
+required, as described in [Auto-selection](#auto-selection).
+
+Before Tier 3 prepares images or stages tasks, each member gets its own
+credential-bearing catalog probe, recorded as `standard grader: PROVIDER:MODEL`
+under `run_config.credential_validation` with the same blocking and degraded
+semantics as a single judge. `run_config.json` records the members,
+aggregation, quorum, and warnings under `judge`, without credentials, and every
+member key is redacted from logs and reports.
+
+The panel delivers member credentials and endpoints through Harbor's job-level
+verifier environment, which outranks task, step, and image values, and does
+not add them to the agent's launch environment. In Harbor's own process, a
+member key that the primary does not already deliver is held under a private
+`SKILLEVALUATOR_JUDGE_PANEL__` name, which Harbor's agent integrations do not
+read, and in Docker mode an NVIDIA Build member key reaches Harbor over
+standard input, as a primary NVIDIA Build key does. Every member endpoint is
+pinned in that job-level layer, including one equal to the primary's, and a
+`bedrock` member also gets `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true`, so the
+AWS SDK ignores `AWS_ENDPOINT_URL*` variables and `endpoint_url` settings in
+AWS config files.
+A key that is also the selected agent's own credential, such as
+`OPENAI_API_KEY` for Codex on OpenAI, still reaches that agent in its agent
+role, as it would without a panel.
+
+<Warning>
+With an `openai-compatible` primary and the `claude-code` agent, the
+`ANTHROPIC_API_KEY` that an `anthropic` member needs also selects Claude
+Code's independent Claude route, described in the OpenAI-compatible tab above.
+Claude Code then runs with that key, against `ANTHROPIC_BASE_URL` when it is
+set and otherwise against the native Anthropic API with `claude-opus-5` by
+default, instead of with the gateway's shared key and URL, so the key reaches
+the agent's environment. SkillEvaluator keeps that route and reports the
+interaction in the `judge-panel` progress line, in `run_config.json` under
+`judge.warnings`, and in the run's warnings, which `result.json` records and
+the end-of-run summary prints. To keep Claude Code on the gateway, unset
+`ANTHROPIC_API_KEY` and judge Claude through a `bedrock` or
+`openai-compatible` member.
+</Warning>
+
+### Judge keys and the evaluated skill
+
+The verifier is not a confidentiality boundary. With a panel, every task runs
+its verifier in the agent's own task environment, after the agent, and code
+the evaluated skill controls can run there too: packages from its
+`scripts/requirements.txt`, which are installed into the verifier's Python;
+its Dockerfile and base image; its `harbor.pre_agent_setup` commands; a custom
+grader in `default_plus_custom` mode; and anything the agent left installed or
+running. Treat every member key as readable by the skill under evaluation, and
+for skills you do not trust, use dedicated, spend-capped, revocable judge
+keys.
+
+Two guards stop a skill from widening that exposure on its own:
+
+- **A skill cannot put its own grader next to the member keys.** When a panel
+  is active and the skill's `evals/config.yml` selects
+  `grading.mode: default_plus_custom`, the run fails at configuration time;
+  `tier3 PATH` checks this before it generates a starter case. Pass
+  `--grading-mode default_plus_custom` to accept the exposure (with
+  dedicated, spend-capped judge keys), `--grading-mode default` to skip the
+  custom grader, or `--judge-panel ''` (or unset `SKILL_EVAL_JUDGE_PANEL`) to
+  run without the panel.
+- **A native task cannot move the verifier into a container it defines.** With
+  a panel, staging fails before Harbor starts when a native Harbor task sets
+  `[verifier] environment_mode` to anything other than `"shared"`, declares a
+  `[verifier.environment]` table, or does either under a `[[steps]]` entry.
+  Without a panel, those tasks stage as before.
+
+Isolating judges from the evaluated skill entirely, by judging on the host or
+in an evaluator-owned verifier image, is not available yet.
+
+### The panel is host-only
+
+Choosing judges is the operator's decision, like choosing credentials: a skill
+that picked its own judges could pick lenient ones. The panel therefore comes
+only from the host environment or `--judge-panel`, never from
+`evals/config.yml`, where `grading.judge_panel` is rejected as an unknown key.
+The four `SKILL_EVAL_JUDGE_PANEL*` names are blocked in `harbor.runtime_env`,
+along with the rest of the `SKILL_EVAL_*` prefix, and a native Harbor task whose
+`[environment.env]`, `[verifier.env]`, or step-level environment table names or
+references one is rejected.
+
+A skill's image cannot set them either. Whether or not a panel is configured,
+every staged task Dockerfile carries this evaluator-owned line after all
+authored and base-image layers:
+
+```dockerfile
+ENV SKILL_EVAL_JUDGE_PANEL="" SKILL_EVAL_JUDGE_PANEL_AGGREGATION="" SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT="" SKILL_EVAL_JUDGE_PANEL_QUORUM=""
+```
+
+The verifier treats an empty value as unset, so runs without a panel score as
+before, and a host panel still reaches the verifier through Harbor's job-level
+verifier environment, which overrides image `ENV`. The reset closes only the
+declarative `ENV` route: files that the image's `RUN` layers install (Python
+startup hooks, for example), `pre_agent_setup` commands, a custom grader, and
+anything the agent leaves behind can still affect the verifier, as described
+in [Judge keys and the evaluated skill](#judge-keys-and-the-evaluated-skill).
+
 ## SkillSpector bridge
 
 The `--llm` security analysis runs [SkillSpector](https://github.com/NVIDIA/SkillSpector), which has its own provider environment (`SKILLSPECTOR_PROVIDER` plus per-provider credential variables). SkillEvaluator bridges your configured provider automatically for that invocation, so the one key above is all you need. For `nv_build`, the bridge uses SkillSpector's OpenAI-compatible provider path pointed at the public Build endpoint, so the same `NVIDIA_API_KEY` covers this too; it does not create a second NVIDIA credential name.

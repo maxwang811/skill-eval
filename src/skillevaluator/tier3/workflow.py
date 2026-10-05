@@ -92,17 +92,25 @@ def _source_snapshot(skill_path: Path) -> Iterator[Path]:
 def _preflight_options(skill_path: Path, params: dict[str, Any]) -> None:
     """Reject known configuration errors before generating a paid dataset."""
     from skillevaluator.cli import _evaluated_source_from_options
-    from skillevaluator.provider_config import resolve_llm_provider
-    from skillevaluator.tier3.commands import parse_agent_model_overrides, resolve_agents, validate_agents
+    from skillevaluator.provider_config import JUDGE_PANEL_ENV, resolve_llm_provider
+    from skillevaluator.tier3.commands import (
+        parse_agent_model_overrides,
+        resolve_agents,
+        resolve_judge_panel_option,
+        validate_agents,
+    )
     from skillevaluator.tier3.evals_config import _validate_config, load_evals_config
     from skillevaluator.tier3.harbor.runner import (
+        _JUDGE_PANEL_CLI_SOURCE,
         _model_for_agent,
         _resolve_agent_runtime_plan,
         _resolve_runtime_env,
+        _skill_selected_custom_grader_error,
         _workspace_skills,
     )
 
     provider = resolve_llm_provider()
+    judge_panel = resolve_judge_panel_option(params.get("judge_panel"))
     config, config_path = load_evals_config(skill_path)
     effective = deepcopy(config)
     effective.setdefault("schema_version", 1)
@@ -128,6 +136,15 @@ def _preflight_options(skill_path: Path, params: dict[str, Any]) -> None:
     _validate_config(effective, config_path or skill_path / "evals" / "config.yml")
     if harbor.get("stop_on_pass", False) and harbor.get("n_attempts", 1) == 1:
         raise ValueError("stop_on_pass requires n_attempts > 1")
+    # The engine refuses this too; checking here avoids paying for a starter case first.
+    if (
+        judge_panel is not None
+        and config_path is not None
+        and not params.get("grading_mode")
+        and config.get("grading", {}).get("mode") == "default_plus_custom"
+    ):
+        source = JUDGE_PANEL_ENV if params.get("judge_panel") is None else _JUDGE_PANEL_CLI_SOURCE
+        raise ValueError(_skill_selected_custom_grader_error(source, config_path.relative_to(skill_path).as_posix()))
 
     workspace = effective.get("skill_workspace", {})
     # Match the expert callback: CLI paths are relative to the caller, while

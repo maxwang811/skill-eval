@@ -255,7 +255,7 @@ so it can consume substantial tokens and exercise task actions; grading is the
 only part disabled. It is off by default. Harbor then starts the selected
 environment and runs the agent in both arms; with standard grading, each transcript is
 judged against the case's expected output and assertions using the configured
-evaluator provider. Finally, SkillEvaluator collects the artifacts and
+evaluator provider, or by each member of a [judge panel](#cross-model-judging). Finally, SkillEvaluator collects the artifacts and
 computes the dimension scores, pass rates, and Skill Lift. Harbor task and job
 directories are transient: they are deleted after collection whether the run
 succeeds or fails, unless you pass `--harbor-keep-jobs`.
@@ -279,7 +279,8 @@ export ANTHROPIC_API_KEY=sk-ant-...   # claude-code's runtime
 `evals/config.yml` may still add permitted task-scoped values through
 `harbor.runtime_env`, but any entry that names — or `${VAR}`-references — an
 operator-owned credential (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-`NVIDIA_API_KEY`, the base-URL variables, `AWS_*`) fails the run with a hard
+`NVIDIA_API_KEY`, the base-URL variables, the AWS credential-chain variables
+such as `AWS_ACCESS_KEY_ID` and `AWS_PROFILE`) fails the run with a hard
 error. This prevents a skill from swapping a credential or routing a trusted
 key to an attacker-controlled endpoint. [Providers &
 Credentials](configuration.mdx) lists every blocked name.
@@ -371,7 +372,8 @@ eval cases × agents × attempts × arms
 
 A standard comparison has two arms (with-skill and without-skill). Each trial
 can make multiple agent-model requests, standard grading adds evaluator-model
-calls, dataset generation can add more, and the optional runtime preflight adds
+calls (multiplied by the member count with a [judge panel](#cost-and-timeouts)),
+dataset generation can add more, and the optional runtime preflight adds
 one extra agent execution per agent. Actual charges therefore depend on the selected
 models, token usage, agent behavior, and environment pricing; SkillEvaluator
 does not estimate a fixed dollar amount. Check the current pricing for your
@@ -424,6 +426,7 @@ The high-signal flags, with defaults:
 | `--progress` | `auto` | Progress rendering: `auto`, `rich` (live TTY view with secret redaction), `plain`, or `off` |
 | `--autopilot` | off | When no evaluation source exists, generate exactly one eval case — with the configured provider, falling back to a deterministic keyless template — never overwriting an existing source |
 | `--grading-mode` | `default` | `default`, `default_plus_custom`, or `custom_only` — see [Custom Graders & Tasks](custom-graders.mdx) |
+| `--judge-panel` | `SKILL_EVAL_JUDGE_PANEL`, else one judge | Score the three LLM-judged metrics with a cross-model judge panel — see [Cross-model judging](#cross-model-judging) |
 | `--results-dir` | `evals/results`, or `SKILLEVALUATOR_RESULTS_DIR` when set | Write results under an external root instead of the skill directory |
 | `--harbor-keep-jobs` | off | Retain Harbor job directories for inspection |
 | `--timeout-multiplier` | `1.0` | Scale Harbor step timeouts |
@@ -437,6 +440,143 @@ modes, is in the [CLI Reference](cli-reference.mdx).
 While iterating on a dataset, `--skip-baseline` roughly halves the runtime.
 Re-enable the baseline arm for any run whose Skill Lift you intend to trust.
 </Tip>
+
+## Cross-model judging
+
+Standard grading scores three of its six metrics with an LLM judge:
+`accuracy`, `goal_accuracy`, and `behavior_check`. By default one judge model
+scores them, so judge noise is invisible, and a judge from the agent's own
+model family may favor that family's transcripts. A judge panel scores those
+three metrics with up to five judges, ideally from different model families,
+combines their verdicts into one score per metric, and reports how well they
+agree. Dimensions, Skill Lift, and verdicts use the combined scores. The
+deterministic metrics and custom graders are unchanged, `custom_only` grading
+validates the panel but does not use it, and runs without a panel score
+exactly as before.
+
+```bash title="Judge with three model families"
+export SKILL_EVAL_LLM_PROVIDER=nv_build   # primary provider for agents and generation
+export NVIDIA_API_KEY='nvapi-...'
+export OPENAI_API_KEY='sk-...'
+export ANTHROPIC_API_KEY='sk-ant-...'
+skillevaluator tier3 evaluate ./my-skill --agents opencode --env-mode docker \
+  --judge-panel 'openai:gpt-5.6-sol,anthropic:claude-opus-5,nv_build:nvidia/nemotron-3-super-120b-a12b'
+```
+
+`--judge-panel` overrides `SKILL_EVAL_JUDGE_PANEL` for one run and also works
+with `tier3 PATH` and `validate`; `--judge-panel ''` turns an exported panel
+off. The panel is validated before the run starts, and before `--autopilot` or
+automatic dataset preparation generates a starter case.
+`SKILL_EVAL_LLM_PROVIDER` still selects the primary provider for agents and
+dataset generation; it is required here because several provider keys are
+exported. Only the operator configures the panel; neither `evals/config.yml`
+nor the skill's image can. [Providers &
+Credentials](configuration.mdx#cross-model-judge-panel) lists every setting,
+credential, and validation rule.
+
+Each member authenticates with its own provider's credential, which the panel
+delivers to the verifier rather than to the agent's launch environment. The
+verifier runs in the agent's task environment, though, where code the
+evaluated skill controls can also run, so treat member keys as readable by the
+skill and use dedicated, spend-capped judge keys for skills you do not trust.
+For the same reason, a panel run refuses a `default_plus_custom` grading mode
+that only the skill's own `evals/config.yml` selects, and a native task whose
+verifier would run in a separate environment; see [Judge keys and the
+evaluated skill](configuration.mdx#judge-keys-and-the-evaluated-skill). With an
+`openai-compatible` primary, the `ANTHROPIC_API_KEY` that an `anthropic` member
+needs also moves Claude Code from the gateway to its independent Claude route;
+SkillEvaluator warns about this but keeps the route, as described under
+[Member credentials](configuration.mdx#member-credentials).
+
+### How verdicts combine
+
+| Aggregation | `accuracy` (five criteria) | `behavior_check` (one verdict per behavior) | `goal_accuracy` |
+| --- | --- | --- | --- |
+| `vote` (default) | Majority per criterion; score = passed criteria / 5 | Majority per behavior; score = passed behaviors / expected behaviors | Majority on whether the goal was achieved; score = median score of the majority side |
+| `median` or `mean` | Median or mean of the member scores | Same | Same |
+
+Voting per criterion resists one judge's systematic bias better than averaging
+totals, and it keeps every rubric verdict explainable. With an even number of
+voters a verdict can tie; a tie counts as 0.5, favoring neither side, so prefer
+an odd member count. An even count with `vote` produces a warning before the
+run starts.
+
+Members run one after another, each with its own judge time budget. When at
+least the quorum succeeds (a majority, `floor(N/2) + 1`, unless
+`SKILL_EVAL_JUDGE_PANEL_QUORUM` says otherwise), the metric is aggregated over
+the successful members and each failure is recorded with a redacted reason. A
+member whose reply is incomplete, such as one with the wrong number of behavior
+verdicts, counts as failed. Below quorum the metric fails closed exactly like a
+failed single judge: the trial becomes an evaluation failure, never a `0.0`
+score (see
+[Judge failures are not zero scores](configuration.mdx#judge-failures-are-not-zero-scores)).
+
+Panel mode keeps each judge fixed and comparable. Judge model fallbacks are
+disabled, so a member never silently switches models, and the OpenAI-only
+RAGAS goal scorer is disabled, so every member answers the same goal-accuracy
+prompt.
+
+### Cost and timeouts
+
+Members run sequentially, so a panel multiplies standard-grading work by its
+member count N while agent work stays the same. Per trial:
+
+```text
+LLM judge calls ≤ 3 metrics × N members × (1 call + 1 format retry)
+```
+
+A judge normally makes one call; the second is a format-correction retry sent
+only when a reply fails validation. Request-level retries come on top: retries
+for rate limits and transient errors (`SKILL_EVAL_LLM_MAX_RETRIES`), and a
+one-time prompt-only resend when an endpoint rejects structured output.
+Multiply by the trial count from [Plan for cost](#plan-for-cost) for a run
+total.
+
+Verifier time grows the same way. The verifier timeout of every generated
+task becomes 600 seconds × N (1,800 seconds for three judges), and so does a
+native Harbor task's when the task sets no `[verifier]` `timeout_sec` of its
+own. Each member keeps its own `SKILL_EVAL_LLM_JUDGE_BUDGET_SEC` budget, 180
+seconds by default. An authored verifier timeout is not modified, so it does
+not scale. Neither do the verifiers of a multi-step native task: Harbor runs
+each `[[steps]]` verifier with that step's own `timeout_sec`, 600 seconds
+unless the step sets one, and never with the task-level value. Tasks
+scaffolded by `init-harbor-task` set `[verifier]` `timeout_sec = 600.0`, so
+they count as authored.
+
+A verifier timeout fails the whole trial, so before trials start SkillEvaluator
+computes every staged native task's verifier budgets the way Harbor applies
+them, each timeout times `--timeout-multiplier`. When a budget falls short of
+600 seconds × N, it adds a warning to the `judge-panel` progress line, to
+`run_config.json` under `judge.warnings`, and to the run's warnings, which
+`result.json` records and the end-of-run summary prints, naming up to five
+tasks or steps.
+Raise their `[verifier]` or `[steps.verifier]` `timeout_sec`, or pass a larger
+`--timeout-multiplier`, which scales every Harbor timeout, including the
+agent's. A scaffolded task warns whenever the panel has two or more judges,
+until you do one of these.
+
+### Same-family judges
+
+A judge may favor transcripts from its own model family, such as a GPT judge
+scoring Codex running a GPT model. The report infers each judge's family from
+its model ID rather than its provider, because NVIDIA Build, Bedrock, and
+gateways host many families, and compares it with the agent model's family.
+Judges that share the agent's family are flagged, and the report compares
+them with the rest of the panel: their mean LLM lift against the other judges'
+mean, and the Skill Lift re-voted without them next to a reference that drops
+as many other-family judges instead. Under `vote` and `median` aggregation,
+re-voting fewer judges changes the lift by itself (with `vote`, two judges tie
+at 0.5 where three form a majority), so read the re-voted lift against that
+reference and the per-judge lifts, never against the headline Skill Lift. A
+model whose family cannot be inferred is labeled `unknown` and never counts as
+same-family. In the example above, the Nemotron judge shares the OpenCode
+agent's family, so the report flags it; choose judges from other families when
+you can.
+
+The report's Judge Panel section also shows each judge's own lift, warns when
+one judge's lift points up and another's points down, measures inter-judge
+agreement, and lists high-disagreement cases. See
+[Reports & Results](reports.mdx#judge-panel).
 
 ## Reading results
 

@@ -2242,6 +2242,22 @@
             .t3-filter-input { flex:1; min-width:220px; padding:0.5rem 0.75rem; border:1px solid var(--border-color); border-radius:8px; background:var(--bg); color:var(--dark-text); font-size:0.88rem; }
             .t3-filter-input:focus { outline:none; border-color:var(--secondary-color); box-shadow:0 0 0 2px rgba(118,185,0,0.15); }
             .t3-filter-count { font-size:0.78rem; color:var(--text-secondary); font-weight:600; }
+            {%- if tier3.get('judge_panel') %}{# judge-panel:css #}
+            /* Judge Panel: per-judge lift, inter-judge agreement, and disagreement cases */
+            .t3-judge-panel-agent { margin:0 0 1.5rem; }
+            .t3-judge-panel-agent:last-child { margin-bottom:0; }
+            .t3-judge-panel-agent h4 { margin:0 0 0.6rem; font-size:1rem; color:var(--dark-text); }
+            .t3-judge-meta { color:var(--text-secondary); font-size:0.8rem; font-weight:400; }
+            .t3-judge-subhead { margin:1rem 0 0.4rem; font-size:0.9rem; font-weight:700; color:var(--dark-text); }
+            .t3-judge-warning { background:var(--badge-warn-bg); border:1px solid var(--warning-color); border-left:4px solid var(--warning-color); border-radius:10px; color:var(--dark-text); margin:0 0 0.75rem; padding:0.7rem 0.9rem; font-size:0.85rem; line-height:1.45; }
+            .t3-agree-value { font-variant-numeric:tabular-nums; font-weight:700; }
+            .t3-agree-value.t3-agree-weak { background:var(--badge-warn-bg); color:var(--badge-warn-tx); }
+            .t3-agree-value.t3-agree-poor { background:var(--badge-fail-bg); color:var(--badge-fail-tx); }
+            .t3-judge-case { border:1px solid var(--border-color); border-radius:8px; margin:0.4rem 0; padding:0.5rem 0.75rem; background:var(--bg); }
+            .t3-judge-case > summary { cursor:pointer; font-size:0.85rem; font-weight:600; color:var(--dark-text); }
+            .t3-judge-case ul { margin:0.5rem 0 0; padding-left:1.1rem; font-size:0.85rem; color:var(--dark-text); }
+            .t3-judge-case li { margin-bottom:0.3rem; }
+            {%- endif %}{# /judge-panel:css #}
 
             /* Print-friendly */
             @media print {
@@ -2545,6 +2561,153 @@
                 </div>
             </details>
             {% endif %}
+            {%- if tier3.get('judge_panel') %}{# judge-panel:section #}
+
+            {# Cross-model judge panel. Judge reasoning quotes untrusted agent output:
+               it relies on autoescaping and must never be marked safe. #}
+            {% set t3_jp_metric_labels = {"accuracy": "Accuracy", "goal_accuracy": "Goal Accuracy", "behavior_check": "Behavior Check", "llm_overall": "LLM Overall"} %}
+            <details class="t3-details" id="tier3-judge-panel" open>
+                <summary>Judge Panel</summary>
+                <div class="t3-details-body">
+                <p class="t3-section-hint">
+                    Several judges from different model families scored the three LLM metrics, and the scores above
+                    use their aggregated verdicts. Fleiss' κ measures how well the judges agree on yes/no verdicts
+                    (accuracy criteria, expected behaviors, goal achieved) and Krippendorff's α on their scores.
+                    Values below 0.4 are highlighted yellow and values below 0.2 red.
+                </p>
+                {% for jp_agent, jp in tier3.get('judge_panel').items() %}
+                {% set jp_per_judge = jp.per_judge or {} %}
+                {% set jp_agreement = jp.agreement or {} %}
+                {% set jp_cases = jp.disagreement_cases or [] %}
+                {% set jp_excluding = jp.lift_excluding_same_family or {} %}
+                <div class="t3-judge-panel-agent">
+                    <h4>{{ jp_agent }}
+                        <span class="t3-judge-meta">{{ jp.aggregation or 'unknown' }} aggregation{% if jp.quorum %}, quorum {{ jp.quorum }}{% endif %}{% if jp.agent_model %} · agent model {{ jp.agent_model }} ({{ jp.agent_family or 'unknown' }} family){% endif %}</span>
+                    </h4>
+                    {% if jp.lift_sign_consistent is sameas false %}
+                    <div class="t3-judge-warning" role="alert" data-judge-warning="lift-sign">
+                        <strong>Judges disagree on the direction of the skill lift.</strong>
+                        LLM overall lift by judge:
+                        {% for label, sign in (jp.lift_signs or {}).items() %}{{ label }} {{ 'up' if sign > 0 else ('down' if sign < 0 else 'flat') }}{{ ', ' if not loop.last else '.' }}{% endfor %}
+                        Treat this agent's LLM-metric lift as inconclusive.
+                    </div>
+                    {% elif jp.lift_sign_consistent is none and (jp.judges or []) | length >= 2 %}
+                    <p class="t3-section-hint" data-judge-note="lift-sign-unavailable">
+                        Sign check unavailable: fewer than two judges have an LLM overall lift, for example because the baseline was skipped or a judge failed every trial of a metric.
+                    </p>
+                    {% endif %}
+                    {% if jp.same_family_judges %}
+                    {% set jp_comparison = jp.same_family_comparison %}
+                    {% set jp_reference = jp_excluding.reference or {} %}
+                    <div class="t3-judge-warning" role="note" data-judge-warning="same-family">
+                        <strong>Same-family judges:</strong> {{ jp.same_family_judges | join(', ') }} {{ 'shares' if (jp.same_family_judges | length) == 1 else 'share' }} the agent's model family and may favor it.
+                        {% if jp_comparison and jp_comparison.same_family_mean_llm_lift is not none and jp_comparison.other_judges_mean_llm_lift is not none %}
+                        Their mean LLM overall lift is {{ "%+.2f" | format(jp_comparison.same_family_mean_llm_lift) }}, against {{ "%+.2f" | format(jp_comparison.other_judges_mean_llm_lift) }} for the other judges (gap {{ "%+.2f" | format(jp_comparison.gap) if jp_comparison.gap is not none else "n/a" }}).
+                        {% endif %}
+                        {% if jp_excluding.available %}
+                        Re-voted without them, the LLM overall lift is {{ "%+.2f" | format(jp_excluding.llm_overall.delta) if jp_excluding.llm_overall and jp_excluding.llm_overall.delta is not none else "n/a" }}
+                        and the overall lift is {{ "%+.2f" | format(jp_excluding.overall.delta) if jp_excluding.overall and jp_excluding.overall.delta is not none else "n/a" }};
+                        {% if jp_reference.subsets %}
+                        {% set jp_reference_llm = (jp_reference.llm_overall or {}).delta %}
+                        {% set jp_reference_overall = (jp_reference.overall or {}).delta %}
+                        dropping as many other-family judges instead gives {{ "%+.2f" | format(jp_reference_llm) if jp_reference_llm is not none else "n/a" }} and {{ "%+.2f" | format(jp_reference_overall) if jp_reference_overall is not none else "n/a" }}
+                        (LLM overall gap {{ "%+.2f" | format(jp_excluding.same_family_gap) if jp_excluding.same_family_gap is not none else "n/a" }}, averaged over {{ jp_reference.subsets }} subset{{ 's' if jp_reference.subsets != 1 else '' }}).
+                        A smaller panel shifts the lift by itself under vote and median aggregation, so compare these two lifts with each other, not with the headline lift.
+                        {% else %}
+                        no like-for-like reference exists because fewer other-family than same-family judges took part.
+                        A smaller panel shifts the lift by itself under vote and median aggregation, so do not compare it with the headline lift.
+                        {% endif %}
+                        {% else %}
+                        Every judge shares the agent's model family, so no independent lift is available.
+                        {% endif %}
+                    </div>
+                    {% endif %}
+                    <p class="t3-judge-subhead">Per-judge scores and skill lift</p>
+                    <div class="table-scroll">
+                    <table class="summary-table">
+                        <thead><tr>
+                            <th>Judge</th><th>Family</th>
+                            {% for metric_id in ["accuracy", "goal_accuracy", "behavior_check", "llm_overall"] %}<th>{{ t3_jp_metric_labels[metric_id] }}</th>{% endfor %}
+                        </tr></thead>
+                        <tbody>
+                        {% for judge in jp.judges or [] %}
+                        {% set jp_row = jp_per_judge.get(judge.judge) or {} %}
+                        {% set jp_failed = jp_row.failed or {} %}
+                        {% set jp_failed_total = (jp_failed.with_skill or 0) + (jp_failed.without_skill or 0) %}
+                        <tr data-judge="{{ judge.judge }}">
+                            <td>
+                                <strong>{{ judge.judge }}</strong>
+                                {% if jp_failed_total %}<div class="t3-dim-hint">{{ jp_failed_total }} failed judgment{{ 's' if jp_failed_total != 1 else '' }}</div>{% endif %}
+                            </td>
+                            <td>{{ judge.family or 'unknown' }}{% if judge.same_family %} <span class="t3-pill warning">same family</span>{% endif %}</td>
+                            {% for metric_id in ["accuracy", "goal_accuracy", "behavior_check", "llm_overall"] %}
+                            {% set jp_with = (jp_row.with_skill or {}).get(metric_id) %}
+                            {% set jp_without = (jp_row.without_skill or {}).get(metric_id) %}
+                            {% set jp_lift = (jp_row.lift or {}).get(metric_id) %}
+                            {% set jp_lift_color = 'var(--success-color)' if jp_lift is not none and jp_lift >= tier3_lift_pass_threshold else ('var(--danger-color)' if jp_lift is not none and jp_lift <= tier3_lift_fail_threshold else 'var(--text-secondary)') %}
+                            <td>
+                                <div class="t3-mad-cell">
+                                    <span class="t3-mad-score">{{ "%.2f" | format(jp_with) if jp_with is not none else "n/a" }}</span>
+                                    <span class="t3-dim-hint">baseline {{ "%.2f" | format(jp_without) if jp_without is not none else "n/a" }}</span>
+                                    <span class="t3-mad-lift" style="color:{{ jp_lift_color }};">{{ ("%+.2f" | format(jp_lift)) ~ " lift" if jp_lift is not none else "no lift" }}</span>
+                                </div>
+                            </td>
+                            {% endfor %}
+                        </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                    </div>
+                    <p class="t3-judge-subhead">Inter-judge agreement</p>
+                    <div class="table-scroll">
+                    <table class="summary-table">
+                        <thead><tr>
+                            <th>Metric</th><th>Fleiss' κ (verdicts)</th><th>Krippendorff's α (scores)</th><th>Observed agreement</th><th>Items (κ / α)</th>
+                        </tr></thead>
+                        <tbody>
+                        {% for metric_id in ["accuracy", "goal_accuracy", "behavior_check"] %}
+                        {% set jp_stats = jp_agreement.get(metric_id) or {} %}
+                        {% set jp_kappa = jp_stats.fleiss_kappa %}
+                        {% set jp_alpha = jp_stats.krippendorff_alpha %}
+                        <tr>
+                            <td><strong>{{ t3_jp_metric_labels[metric_id] }}</strong></td>
+                            <td class="t3-agree-value{{ ' t3-agree-poor' if jp_kappa is not none and jp_kappa < 0.2 else (' t3-agree-weak' if jp_kappa is not none and jp_kappa < 0.4 else '') }}" data-agreement-metric="{{ metric_id }}" data-agreement-stat="kappa">{{ "%.2f" | format(jp_kappa) if jp_kappa is not none else "n/a" }}</td>
+                            <td class="t3-agree-value{{ ' t3-agree-poor' if jp_alpha is not none and jp_alpha < 0.2 else (' t3-agree-weak' if jp_alpha is not none and jp_alpha < 0.4 else '') }}" data-agreement-metric="{{ metric_id }}" data-agreement-stat="alpha">{{ "%.2f" | format(jp_alpha) if jp_alpha is not none else "n/a" }}</td>
+                            <td>{{ "%.0f%%" | format(jp_stats.observed_agreement * 100) if jp_stats.observed_agreement is not none else "n/a" }}</td>
+                            <td>{{ jp_stats.kappa_items or 0 }} / {{ jp_stats.alpha_units or 0 }}</td>
+                        </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                    </div>
+                    <p class="t3-judge-subhead">High-disagreement cases</p>
+                    {% if jp_cases %}
+                    <p class="t3-section-hint">
+                        Trial metrics whose judge scores differ by at least {{ "%.2f" | format(jp.disagreement_threshold) if jp.disagreement_threshold is not none else "the panel threshold" }}.
+                        Expand a case to read each judge's score and reasoning.
+                    </p>
+                    {% for case in jp_cases %}
+                    <details class="t3-judge-case">
+                        <summary>{{ case.entry_id or 'unknown case' }}{% if case.trial_id and case.trial_id != case.entry_id %} · trial {{ case.trial_id }}{% endif %}{% if case.step %} (step {{ case.step }}){% endif %} · {{ t3_jp_metric_labels.get(case.metric, case.metric) }} · {{ 'with skill' if case.condition == 'with_skill' else 'without skill' }} · spread {{ "%.2f" | format(case.spread) if case.spread is not none else "n/a" }}</summary>
+                        <ul>
+                            {% for label, score in (case.scores or {}).items() %}
+                            {% set jp_reason = (case.reasons or {}).get(label) %}
+                            <li><strong>{{ label }}</strong>: {{ "%.2f" | format(score) if score is not none else "failed" }}{% if jp_reason %} — {{ jp_reason }}{% endif %}</li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endfor %}
+                    {% elif not jp.disagreement_cases_truncated %}
+                    <p class="t3-section-hint">No judge disagreements reached the panel's spread threshold.</p>
+                    {% endif %}
+                    {% if jp.disagreement_cases_truncated %}
+                    <p class="t3-section-hint">{{ jp.disagreement_cases_truncated }} {{ 'more ' if jp_cases else '' }}high-disagreement case{{ 's are' if jp.disagreement_cases_truncated != 1 else ' is' }} not listed; each trial's reward.json keeps every judge's verdict.</p>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                </div>
+            </details>
+            {%- endif %}{# /judge-panel:section #}
 
         </section>
 

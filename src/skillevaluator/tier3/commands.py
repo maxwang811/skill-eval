@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -25,7 +26,13 @@ from rich.text import Text
 from skillevaluator import __version__
 from skillevaluator.evaluation.results import DatasetGenerationError, DatasetGenerationResult
 from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
-from skillevaluator.provider_config import ProviderConfigurationError, resolve_llm_provider
+from skillevaluator.provider_config import (
+    JudgePanelConfig,
+    ProviderConfig,
+    ProviderConfigurationError,
+    resolve_judge_panel_config,
+    resolve_llm_provider,
+)
 from skillevaluator.tier3.case_ids import safe_child, validate_case_id, validate_case_ids
 from skillevaluator.tier3.dataset_utils import DATASET_EXTENSIONS, load_dataset_entries_with_format
 from skillevaluator.tier3.evals_config import CONFIG_FILENAMES, _validate_config, load_evals_config
@@ -50,6 +57,7 @@ from skillevaluator.tier3.harbor.runner import (
     _harbor_bin,
     _model_for_agent,
     _resolve_agent_runtime_plan,
+    _resolve_run_judge_panel,
     run_harbor_eval,
 )
 from skillevaluator.tier3.harbor.secure_copy import copytree_secure
@@ -75,6 +83,8 @@ _DEFAULT_AGENT_BY_PROVIDER = {
     "bedrock": "claude-code",
     "openai-compatible": "codex",
 }
+# The LLM-judged metrics a judge panel scores; ``compare`` shows their agreement.
+_JUDGE_PANEL_METRICS = ("accuracy", "goal_accuracy", "behavior_check")
 
 
 def _engine_env_mode(value: str) -> str:
@@ -392,6 +402,23 @@ def validate_agents(agents: list[str]) -> list[str]:
     return [agent for agent in agents if agent not in HARBOR_AGENTS]
 
 
+def resolve_judge_panel_option(judge_panel: str | None) -> JudgePanelConfig | None:
+    """Resolve the run's judge panel exactly as the engine will.
+
+    ``None`` keeps the host ``SKILL_EVAL_JUDGE_PANEL``. Any other value
+    (``--judge-panel``) replaces it, and errors about the panel then name the
+    flag; a blank value turns the panel off and ignores the
+    ``SKILL_EVAL_JUDGE_PANEL_*`` knobs. A misconfigured panel raises
+    ``ValueError`` so callers fail before any paid work starts; callers read
+    advisory warnings from the returned config.
+    """
+    try:
+        panel, _source = _resolve_run_judge_panel(judge_panel)
+    except ProviderConfigurationError as exc:
+        raise ValueError(f"Invalid judge panel configuration: {exc}") from exc
+    return panel
+
+
 def create_dataset(
     skill_path: Path,
     *,
@@ -653,8 +680,13 @@ def evaluate(
     override_storage_mb: int | None,
     evaluated_source: dict[str, str] | None = None,
     progress_reporter: ProgressReporter | None = None,
+    judge_panel: str | None = None,
 ) -> dict[str, Any]:
-    """Run Harbor live-agent evaluation for a skill."""
+    """Run Harbor live-agent evaluation for a skill.
+
+    ``judge_panel`` (``--judge-panel``) replaces the host ``SKILL_EVAL_JUDGE_PANEL``
+    value, and a blank value turns the panel off; ``None`` keeps the host value.
+    """
     env_mode = _engine_env_mode(env_mode)
 
     if agents is None:
@@ -694,6 +726,7 @@ def evaluate(
                 resolve_llm_provider()
             except ProviderConfigurationError as exc:
                 raise ValueError(f"A public LLM provider is required for live evaluation: {exc}") from exc
+        resolve_judge_panel_option(judge_panel)
 
         agent_models = parse_agent_model_overrides(agent_model)
         unknown_model_agents = sorted(set(agent_models) - set(agent_list))
@@ -731,6 +764,7 @@ def evaluate(
             override_memory_mb=override_memory_mb,
             override_storage_mb=override_storage_mb,
             progress_reporter=reporter,
+            judge_panel=judge_panel,
         )
     except Exception as exc:
         if not engine_started:
@@ -814,6 +848,21 @@ def doctor(
         elif plan_error is not None:
             rows.append(("Agent runtime credential", "fail", plan_error))
 
+    # The panel row exists only when the operator configured one, so a host
+    # without a panel sees the same checks as before.
+    judge_panel: JudgePanelConfig | None = None
+    try:
+        judge_panel = resolve_judge_panel_config()
+    except ProviderConfigurationError as exc:
+        rows.append(("Judge panel", "fail", str(exc)))
+    if judge_panel is not None:
+        members = ", ".join(member.label for member in judge_panel.members)
+        detail = f"{members} ({judge_panel.aggregation}, quorum {judge_panel.quorum})"
+        if judge_panel.warnings:
+            rows.append(("Judge panel", "warn", "; ".join((detail, *judge_panel.warnings))))
+        else:
+            rows.append(("Judge panel", "pass", detail))
+
     unknown = validate_agents(agent_list)
     if unknown:
         rows.append(("Harbor agents", "fail", f"Unknown: {', '.join(unknown)}"))
@@ -835,28 +884,13 @@ def doctor(
         if provider is None or not runtime_plans:
             rows.append(("provider model", "fail", "provider model resolution was unavailable"))
         else:
-            from skillevaluator.tier3.harbor.runtime_preflight import (
-                CredentialProbeDisposition,
-                credential_probe_disposition,
-                probe_model,
-            )
-
             for agent in agent_list:
-                selected_provider = runtime_plans[agent].provider
-                probe = probe_model(selected_provider)
-                disposition = credential_probe_disposition(selected_provider, probe)
-                if disposition == CredentialProbeDisposition.FATAL:
-                    status = "fail"
-                    detail = probe.detail
-                elif disposition == CredentialProbeDisposition.DEGRADED:
-                    status = "warn"
-                    detail = probe.detail
-                    if probe.ok:
-                        detail = f"{detail}; catalog access does not verify runtime credentials for this endpoint"
-                else:
-                    status = "pass"
-                    detail = probe.detail
-                rows.append((f"{agent} model", status, detail))
+                rows.append(_model_probe_row(f"{agent} model", runtime_plans[agent].provider))
+        # Each member carries its own credential, so the panel is probed even
+        # when the agent plan could not be resolved.
+        if judge_panel is not None:
+            for member in judge_panel.members:
+                rows.append(_model_probe_row(f"judge {member.label}", member.provider_config()))
 
     table = Table(title="SkillEvaluator Doctor", box=SIMPLE, show_edge=False)
     table.add_column("Check", style="bold")
@@ -868,6 +902,26 @@ def doctor(
         table.add_row(escape_markup(str(name)), f"[{style}]{status}[/{style}]", escape_markup(str(detail)))
     console.print(table)
     return 1 if any(row[1] == "fail" for row in rows) else 0
+
+
+def _model_probe_row(check: str, selected_provider: ProviderConfig) -> tuple[str, str, str]:
+    """Probe one model route's catalog and classify it as a doctor row."""
+    from skillevaluator.tier3.harbor.runtime_preflight import (
+        CredentialProbeDisposition,
+        credential_probe_disposition,
+        probe_model,
+    )
+
+    probe = probe_model(selected_provider)
+    disposition = credential_probe_disposition(selected_provider, probe)
+    if disposition == CredentialProbeDisposition.FATAL:
+        return check, "fail", probe.detail
+    if disposition == CredentialProbeDisposition.DEGRADED:
+        detail = probe.detail
+        if probe.ok:
+            detail = f"{detail}; catalog access does not verify runtime credentials for this endpoint"
+        return check, "warn", detail
+    return check, "pass", probe.detail
 
 
 def validate_evals(skill_path: Path, *, as_json: bool, strict: bool, harbor_contract: bool) -> int:
@@ -1063,6 +1117,12 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
 
     agents = sorted(agent_with)
     display_metrics, overall_metrics = _display_metrics(agent_with)
+    # Only runs that used a judge panel get an agreement column.
+    judge_agreement = {
+        agent: agreement
+        for agent in agents
+        if (agreement := _judge_panel_agreement(Path(agent_meta[agent]["path"]))) is not None
+    }
 
     table = Table(show_header=True, header_style="bold dim", box=SIMPLE, padding=(0, 1), show_edge=False, expand=True)
     table.add_column("Evaluator", style="white", min_width=18, no_wrap=True)
@@ -1070,6 +1130,8 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
         table.add_column(f"{escape_markup(agent)}\nscore", justify="right", min_width=7)
         if agent in agent_without:
             table.add_column("\nlift", justify="right", min_width=7)
+        if agent in judge_agreement:
+            table.add_column("judges\nκ/α", justify="right", min_width=9)  # noqa: RUF001 -- Fleiss' kappa / Krippendorff's alpha
 
     for metric in display_metrics:
         row: list[str | Text] = [Text(strip_terminal_controls(metric))]
@@ -1085,9 +1147,11 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
                     row.append(Text(f"{delta:.2f}", style="red"))
                 else:
                     row.append(Text("  -", style="dim"))
+            if agent in judge_agreement:
+                row.append(_judge_agreement_cell(judge_agreement[agent].get(metric)))
         table.add_row(*row)
 
-    table.add_row(*[""] * (1 + sum(2 if agent in agent_without else 1 for agent in agents)))
+    table.add_row(*[""] * (1 + sum(1 + (agent in agent_without) + (agent in judge_agreement) for agent in agents)))
     overall_row: list[str | Text] = [Text("Overall", style="bold")]
     for agent in agents:
         with_avg = sum(_safe_score(agent_with[agent], metric) for metric in overall_metrics) / len(overall_metrics)
@@ -1100,6 +1164,8 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
             delta_text = f"+{delta:.2f}" if delta > 0 else f"{delta:.2f}"
             delta_style = "bold green" if delta > 0 else ("bold red" if delta < 0 else "bold dim")
             overall_row.append(Text(delta_text, style=delta_style))
+        if agent in judge_agreement:
+            overall_row.append("")
     table.add_row(*overall_row)
 
     console.print()
@@ -1158,6 +1224,52 @@ def _display_metrics(agent_with: dict[str, dict[str, float]]) -> tuple[tuple[str
 def _safe_score(scores: dict[str, float], metric: str) -> float:
     value = scores.get(metric, 0.0)
     return float(value) if isinstance(value, int | float) else 0.0
+
+
+def _judge_panel_agreement(agent_dir: Path) -> dict[str, tuple[float | None, float | None]] | None:
+    """Return each LLM metric's (Fleiss' kappa, Krippendorff's alpha), or None for a run without a panel.
+
+    A missing, linked, oversized, or non-object ``judge_panel.json`` counts as
+    no panel, so such runs compare exactly as before.
+    """
+    from skillevaluator.tier3.harbor.report_data import _load_bounded_json
+
+    payload = _load_bounded_json(agent_dir / "judge_panel.json", [], artifact="judge_panel")
+    if not isinstance(payload, dict):
+        return None
+    agreement = payload.get("agreement")
+    if not isinstance(agreement, dict):
+        agreement = {}
+    values: dict[str, tuple[float | None, float | None]] = {}
+    for metric in _JUDGE_PANEL_METRICS:
+        entry = agreement.get(metric)
+        if not isinstance(entry, dict):
+            entry = {}
+        values[metric] = (_finite_number(entry.get("fleiss_kappa")), _finite_number(entry.get("krippendorff_alpha")))
+    return values
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _judge_agreement_cell(values: tuple[float | None, float | None] | None) -> str | Text:
+    """Render ``kappa/alpha`` for an LLM metric; other metrics leave the cell blank."""
+    if values is None:
+        return ""
+    available = [value for value in values if value is not None]
+    if not available:
+        return Text("-", style="dim")
+    lowest = min(available)
+    # The report's rule of thumb: below 0.2 is poor agreement, below 0.4 weak.
+    style = "red" if lowest < 0.2 else "yellow" if lowest < 0.4 else ""
+    return Text("/".join("-" if value is None else f"{value:.2f}" for value in values), style=style)
 
 
 def _score_style(score: float) -> str:

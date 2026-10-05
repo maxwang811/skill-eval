@@ -477,6 +477,14 @@
           "param_type": "option"
         },
         {
+          "name": "judge_panel",
+          "opts": [
+            "--judge-panel"
+          ],
+          "param_type": "option",
+          "type": "text"
+        },
+        {
           "name": "results_dir",
           "opts": [
             "--results-dir"
@@ -2276,6 +2284,14 @@
               "param_type": "option"
             },
             {
+              "name": "judge_panel",
+              "opts": [
+                "--judge-panel"
+              ],
+              "param_type": "option",
+              "type": "text"
+            },
+            {
               "name": "results_dir",
               "opts": [
                 "--results-dir"
@@ -2761,6 +2777,14 @@
             "param_type": "option"
           },
           {
+            "name": "judge_panel",
+            "opts": [
+              "--judge-panel"
+            ],
+            "param_type": "option",
+            "type": "text"
+          },
+          {
             "name": "results_dir",
             "opts": [
               "--results-dir"
@@ -3206,6 +3230,14 @@
             "--grading-mode"
           ],
           "param_type": "option"
+        },
+        {
+          "name": "judge_panel",
+          "opts": [
+            "--judge-panel"
+          ],
+          "param_type": "option",
+          "type": "text"
         },
         {
           "name": "results_dir",

@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import posixpath
 import re
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
+from skillevaluator.provider_config import JUDGE_PANEL_ENV_VARS
 from skillevaluator.tier3.case_ids import safe_child, validate_case_ids, validate_output_directory_path
 from skillevaluator.tier3.harbor import DEFAULT_LLM_VERIFIER_TIMEOUT_SEC
 from skillevaluator.tier3.harbor.secure_copy import (
@@ -245,12 +247,16 @@ _VERIFIER_PROVIDER_ENV_VARS = frozenset(
         "OPENAI_BASE_URL",
         *_VERIFIER_BUDGET_ENV_VARS,
         *_VERIFIER_RETRY_ENV_VARS,
+        *JUDGE_PANEL_ENV_VARS,
         "SKILL_EVAL_LLM_API_KEY",
         "SKILL_EVAL_LLM_BASE_URL",
         "SKILL_EVAL_LLM_MODEL",
         "SKILL_EVAL_LLM_PROVIDER",
     }
 )
+# Judge-panel settings and the runner's private member-credential aliases are
+# evaluator-owned. A native task must not name or reference them in any env table.
+_JUDGE_PANEL_CONTROL_PREFIXES = ("SKILL_EVAL_JUDGE_PANEL", "SKILLEVALUATOR_JUDGE_PANEL__")
 
 
 def _verifier_env_vars(runtime_env: dict[str, str] | None = None) -> tuple[str, ...]:
@@ -260,6 +266,20 @@ def _verifier_env_vars(runtime_env: dict[str, str] | None = None) -> tuple[str, 
 
 def _verifier_env_block(runtime_env: dict[str, str] | None = None, indent: str = "") -> str:
     return "\n".join(f'{indent}{name} = "${{{name}}}"' for name in _verifier_env_vars(runtime_env))
+
+
+def _verifier_timeout_value(verifier_timeout_sec: float | None) -> float:
+    """Return the staged ``[verifier] timeout_sec``; ``None`` keeps the single-judge default."""
+    if verifier_timeout_sec is None:
+        return DEFAULT_LLM_VERIFIER_TIMEOUT_SEC
+    if (
+        isinstance(verifier_timeout_sec, bool)
+        or not isinstance(verifier_timeout_sec, int | float)
+        or not math.isfinite(verifier_timeout_sec)
+        or verifier_timeout_sec <= 0
+    ):
+        raise ValueError("verifier timeout must be a positive, finite number of seconds")
+    return float(verifier_timeout_sec)
 
 
 def _find_repo_root(path: Path) -> Path | None:
@@ -1812,9 +1832,11 @@ def _write_task_toml(
     pre_agent_setup: list[str] | None = None,
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
+    verifier_timeout_sec: float | None = None,
 ) -> None:
     entry_id = entry.get("id", "unknown")
     expected_skill = entry.get("expected_skill") or "none"
+    verifier_timeout = _verifier_timeout_value(verifier_timeout_sec)
     if not isinstance(entry_id, str):
         raise TypeError("entry id must be a string before Harbor TOML serialization")
     if not isinstance(expected_skill, str):
@@ -1842,7 +1864,7 @@ has_skill = {str(has_skill).lower()}
 timeout_sec = 300.0
 
 [verifier]
-timeout_sec = {DEFAULT_LLM_VERIFIER_TIMEOUT_SEC}
+timeout_sec = {verifier_timeout}
 
 [verifier.env]
 {_verifier_env_block(verifier_env if verifier_env is not None else runtime_env)}
@@ -3218,6 +3240,10 @@ _RUNTIME_LOADER_ENV_NAMES = frozenset(
 _RUNTIME_LOADER_ENV_PREFIXES = ("BASH_FUNC_",)
 _RUNTIME_LOADER_ENV_RESET = "ENV " + " ".join(f'{name}=""' for name in sorted(_RUNTIME_LOADER_ENV_NAMES))
 _RUNTIME_POLICY_ENV_RESET = 'ENV CLAUDE_CODE_DISABLE_POLICY_SKILLS="1"'
+# Only the host configures a judge panel: blank its settings after every authored
+# layer so skill image ENV cannot select one. The verifier reads blank as unset, and
+# a host panel still arrives through the job-level verifier environment.
+_JUDGE_PANEL_ENV_RESET = "ENV " + " ".join(f'{name}=""' for name in sorted(JUDGE_PANEL_ENV_VARS))
 _EVALUATOR_MANAGED_RUNTIME_ENV = {
     **dict.fromkeys(_RUNTIME_LOADER_ENV_NAMES, ""),
     "CLAUDE_CODE_DISABLE_POLICY_SKILLS": "1",
@@ -3412,6 +3438,7 @@ def _append_task_input_projection(
             *agent_config_lines,
             _RUNTIME_LOADER_ENV_RESET,
             _RUNTIME_POLICY_ENV_RESET,
+            _JUDGE_PANEL_ENV_RESET,
             "ENTRYPOINT []",
             "HEALTHCHECK NONE",
         ]
@@ -3441,6 +3468,7 @@ def _extend_task_input_projection(lines: list[str], *, include_input: bool, agen
             *agent_config_lines,
             _RUNTIME_LOADER_ENV_RESET,
             _RUNTIME_POLICY_ENV_RESET,
+            _JUDGE_PANEL_ENV_RESET,
             "ENTRYPOINT []",
             "HEALTHCHECK NONE",
         ]
@@ -4281,14 +4309,106 @@ def _validate_native_agent_judge_model_controls(task_toml: Path, environment_env
         )
 
 
-def _native_task_workdir(task_dir: Path, *, allow_docker_image: bool = False) -> str | None:
-    """Read and validate the workdir Harbor will use for a native task."""
+def _judge_panel_env_controls(environment: dict[str, Any]) -> set[str]:
+    """Return judge-panel settings or private panel aliases used as keys or value references."""
+    authored_keys = {str(name) for name in environment if str(name).upper().startswith(_JUDGE_PANEL_CONTROL_PREFIXES)}
+    authored_references = {
+        reference
+        for value in environment.values()
+        for reference in _environment_reference_names(value)
+        if reference.upper().startswith(_JUDGE_PANEL_CONTROL_PREFIXES)
+    }
+    return authored_keys | authored_references
+
+
+def _toml_env_tables(value: object, path: str = "") -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield every ``env`` table in a parsed task config with its dotted path, depth first.
+
+    The walk uses an explicit stack: dotted TOML keys can nest tables deeper than
+    the interpreter's recursion limit.
+    """
+    # Each entry is (path, value, env table to yield); a None table means "walk value".
+    pending: list[tuple[str, object, dict[str, Any] | None]] = [(path, value, None)]
+    while pending:
+        current_path, current, env_table = pending.pop()
+        if env_table is not None:
+            yield current_path, env_table
+            continue
+        children: list[tuple[str, object, dict[str, Any] | None]] = []
+        if isinstance(current, dict):
+            for key, child in current.items():
+                child_path = f"{current_path}.{key}" if current_path else str(key)
+                if key == "env" and isinstance(child, dict):
+                    children.append((child_path, child, child))
+                children.append((child_path, child, None))
+        elif isinstance(current, list):
+            children.extend((f"{current_path}[{index}]", child, None) for index, child in enumerate(current))
+        pending.extend(reversed(children))
+
+
+def _validate_native_judge_panel_controls(task_toml: Path, data: dict[str, Any]) -> None:
+    """Keep judge selection evaluator-owned: no task, step, or verifier env may touch the panel."""
+    for table, environment in _toml_env_tables(data):
+        controls = sorted(_judge_panel_env_controls(environment))
+        if controls:
+            raise ValueError(
+                f"Native Harbor task [{table}] cannot name or reference evaluator-controlled judge panel "
+                f"variable(s): {', '.join(controls)}: {task_toml}"
+            )
+
+
+def _validate_native_panel_shared_verifier(task_toml: Path, data: dict[str, Any]) -> None:
+    """Keep a judge panel's verifier in the evaluator-staged agent container.
+
+    A separate verifier environment, at task or step level, runs in a container
+    the task defines and would receive every panel member credential.
+    """
+    verifiers: list[tuple[str, object]] = [("verifier", data.get("verifier"))]
+    steps = data.get("steps")
+    if isinstance(steps, list):
+        verifiers.extend(
+            (f"steps[{index}].verifier", step.get("verifier"))
+            for index, step in enumerate(steps)
+            if isinstance(step, dict)
+        )
+    for table, verifier in verifiers:
+        if not isinstance(verifier, dict):
+            continue
+        if verifier.get("environment_mode", "shared") != "shared":
+            raise ValueError(
+                f'Native Harbor task [{table}] environment_mode must be omitted or "shared" when a judge panel is '
+                "configured: a separate verifier environment would receive the panel member credentials. "
+                f"Remove it or run without the panel: {task_toml}"
+            )
+        if "environment" in verifier:
+            raise ValueError(
+                f"Native Harbor task [{table}.environment] cannot be used when a judge panel is configured: "
+                "a separate verifier environment would receive the panel member credentials. "
+                f"Remove it or run without the panel: {task_toml}"
+            )
+
+
+def _native_task_workdir(
+    task_dir: Path,
+    *,
+    allow_docker_image: bool = False,
+    judge_panel_active: bool = False,
+) -> str | None:
+    """Read and validate the workdir Harbor will use for a native task.
+
+    ``judge_panel_active`` also requires every verifier pass to run in the shared,
+    evaluator-staged agent container.
+    """
     try:
         import tomllib
 
         data = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
     except Exception as exc:
         raise ValueError(f"Cannot parse native Harbor task config: {task_dir / 'task.toml'}") from exc
+    if isinstance(data, dict):
+        _validate_native_judge_panel_controls(task_dir / "task.toml", data)
+        if judge_panel_active:
+            _validate_native_panel_shared_verifier(task_dir / "task.toml", data)
     environment = data.get("environment", {}) if isinstance(data, dict) else {}
     if not isinstance(environment, dict):
         raise ValueError(f"Native Harbor task [environment] must be a table: {task_dir / 'task.toml'}")
@@ -4388,8 +4508,14 @@ def _merge_toml_env_table_section(
     lines[idx:env_end] = updated_section
 
 
-def _ensure_skill_evaluator_verifier_env(task_dir: Path, *, verifier_env: dict[str, str] | None) -> None:
+def _ensure_skill_evaluator_verifier_env(
+    task_dir: Path,
+    *,
+    verifier_env: dict[str, str] | None,
+    verifier_timeout_sec: float | None = None,
+) -> None:
     """Ensure staged native tasks forward configured public provider variables."""
+    verifier_timeout = _verifier_timeout_value(verifier_timeout_sec)
     rendered = {name: f'{name} = "${{{name}}}"' for name in _verifier_env_vars(verifier_env)}
     if not rendered:
         return
@@ -4420,12 +4546,50 @@ def _ensure_skill_evaluator_verifier_env(task_dir: Path, *, verifier_env: dict[s
     insert_at = env_table_idx if env_table_idx is not None else len(lines)
     lines[insert_at:insert_at] = [
         "[verifier]",
-        f"timeout_sec = {DEFAULT_LLM_VERIFIER_TIMEOUT_SEC}",
+        f"timeout_sec = {verifier_timeout}",
         "",
         *env_block,
         "",
     ]
     task_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _ensure_native_panel_verifier_timeout(task_dir: Path, verifier_timeout_sec: float) -> None:
+    """Give a native task with no authored verifier timeout the judge-panel budget.
+
+    Only used in panel mode. An authored ``[verifier] timeout_sec`` is never
+    modified; ``--timeout-multiplier`` scales those instead.
+    """
+    task_toml = task_dir / "task.toml"
+    content = task_toml.read_text(encoding="utf-8")
+    verifier = tomllib.loads(content).get("verifier")
+    if isinstance(verifier, dict) and "timeout_sec" in verifier:
+        return
+
+    timeout = _verifier_timeout_value(verifier_timeout_sec)
+    timeout_line = f"timeout_sec = {timeout}"
+    lines = content.splitlines()
+    verifier_idx = next((i for i, line in enumerate(lines) if _toml_table_header(line) == "[verifier]"), None)
+    if verifier_idx is not None:
+        lines.insert(verifier_idx + 1, timeout_line)
+    else:
+        # The table is only implied by sub-tables such as [verifier.env]; define it first.
+        subtable_idx = next(
+            (i for i, line in enumerate(lines) if (_toml_table_header(line) or "").startswith("[verifier.")),
+            len(lines),
+        )
+        lines[subtable_idx:subtable_idx] = ["[verifier]", timeout_line, ""]
+    updated = "\n".join(lines) + "\n"
+    try:
+        staged_verifier = tomllib.loads(updated).get("verifier")
+    except tomllib.TOMLDecodeError:
+        staged_verifier = None
+    if not isinstance(staged_verifier, dict) or staged_verifier.get("timeout_sec") != timeout:
+        raise ValueError(
+            f"{task_toml}: cannot add the judge-panel verifier timeout; set [verifier] timeout_sec explicitly "
+            "or scale it with --timeout-multiplier"
+        )
+    task_toml.write_text(updated, encoding="utf-8")
 
 
 def _insert_table_block(lines: list[str], anchor: str, block: list[str]) -> None:
@@ -4625,6 +4789,7 @@ def _stage_native_harbor_tasks_into(
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
     baseline_aliases_prevalidated: bool = False,
+    verifier_timeout_sec: float | None = None,
 ) -> list[Path]:
     """Build native Harbor tasks inside a private, caller-owned directory.
 
@@ -4650,8 +4815,10 @@ def _stage_native_harbor_tasks_into(
     if not source_task_dirs:
         raise ValueError(f"No Harbor task directories with task.toml found in {native_dir}")
     validate_case_ids(path.name for path in source_task_dirs)
+    # Only judge-panel runs stage a verifier timeout.
+    judge_panel_active = verifier_timeout_sec is not None
     for source_task_dir in source_task_dirs:
-        _native_task_workdir(source_task_dir)
+        _native_task_workdir(source_task_dir, judge_panel_active=judge_panel_active)
     _ = task_resources
     _ = agent_workdir
 
@@ -4682,7 +4849,7 @@ def _stage_native_harbor_tasks_into(
         baseline_aliases_prevalidated = True
     for task_dir in task_dirs:
         entry_id = _native_entry_id(task_dir)
-        native_agent_workdir = _native_task_workdir(task_dir)
+        native_agent_workdir = _native_task_workdir(task_dir, judge_panel_active=judge_panel_active)
         _ensure_native_skills_dir(task_dir)
         entry = entries_by_id.get(entry_id)
         if grading_mode in ("default", "default_plus_custom") and entry is None:
@@ -4709,7 +4876,10 @@ def _stage_native_harbor_tasks_into(
             _ensure_skill_evaluator_verifier_env(
                 task_dir,
                 verifier_env=verifier_env if verifier_env is not None else runtime_env,
+                verifier_timeout_sec=verifier_timeout_sec,
             )
+            if verifier_timeout_sec is not None:
+                _ensure_native_panel_verifier_timeout(task_dir, verifier_timeout_sec)
             _write_entry_json(
                 task_dir,
                 entry or {"id": entry_id},
@@ -4813,8 +4983,14 @@ def stage_native_harbor_tasks(
     agent_workdir: str | None = None,
     evaluator_skill_path: Path | None = None,
     _baseline_alias_validation: _BaselineAliasValidation | None = None,
+    verifier_timeout_sec: float | None = None,
 ) -> list[Path]:
-    """Stage native tasks privately, then publish one exact output snapshot."""
+    """Stage native tasks privately, then publish one exact output snapshot.
+
+    ``verifier_timeout_sec`` is set only for judge-panel runs. It applies only where
+    the task has no authored verifier timeout, and a task that declares a separate
+    verifier environment is rejected; ``None`` keeps today's staging byte-for-byte.
+    """
 
     if evaluator_skill_path is None:
         with private_evaluator_skill_snapshot(skill_path, task_source="native_harbor") as private_skill_path:
@@ -4837,6 +5013,7 @@ def stage_native_harbor_tasks(
                 agent_workdir=agent_workdir,
                 evaluator_skill_path=private_skill_path,
                 _baseline_alias_validation=_baseline_alias_validation,
+                verifier_timeout_sec=verifier_timeout_sec,
             )
 
     baseline_aliases_prevalidated = False
@@ -4903,6 +5080,7 @@ def stage_native_harbor_tasks(
             task_resources=task_resources,
             agent_workdir=agent_workdir,
             baseline_aliases_prevalidated=baseline_aliases_prevalidated,
+            verifier_timeout_sec=verifier_timeout_sec,
         )
         relative_tasks = [task.relative_to(private_output) for task in private_tasks]
         if output_requires_provenance:
@@ -4961,6 +5139,7 @@ def _generate_harbor_tasks_into(
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
     baseline_aliases_prevalidated: bool = False,
+    verifier_timeout_sec: float | None = None,
 ) -> list[Path]:
     """Generate Harbor task directories inside a private output directory.
 
@@ -4989,6 +5168,8 @@ def _generate_harbor_tasks_into(
             defaults.
         agent_workdir: Optional default working directory for agent command
             execution inside the Harbor task environment.
+        verifier_timeout_sec: Optional ``[verifier] timeout_sec`` for judge-panel
+            runs; ``None`` keeps ``DEFAULT_LLM_VERIFIER_TIMEOUT_SEC``.
 
     Returns:
         List of generated task directory paths.
@@ -5057,6 +5238,7 @@ def _generate_harbor_tasks_into(
             pre_agent_setup=pre_agent_setup,
             task_resources=task_resources,
             agent_workdir=agent_workdir,
+            verifier_timeout_sec=verifier_timeout_sec,
         )
         _copy_verifier(task_dir)
         custom_grader = _copy_custom_grader(task_dir, skill_path, grading_mode, evals_dir=evals_dir)
@@ -5492,8 +5674,13 @@ def generate_harbor_tasks(
     agent_workdir: str | None = None,
     evaluator_skill_path: Path | None = None,
     _baseline_alias_validation: _BaselineAliasValidation | None = None,
+    verifier_timeout_sec: float | None = None,
 ) -> list[Path]:
-    """Generate tasks from one private evals snapshot, then publish exactly."""
+    """Generate tasks from one private evals snapshot, then publish exactly.
+
+    ``verifier_timeout_sec`` sets the judge-panel ``[verifier] timeout_sec``;
+    ``None`` keeps today's generated ``task.toml`` byte-for-byte.
+    """
 
     if evaluator_skill_path is None:
         if find_evals_file(skill_path) is None:
@@ -5518,6 +5705,7 @@ def generate_harbor_tasks(
                 agent_workdir=agent_workdir,
                 evaluator_skill_path=private_skill_path,
                 _baseline_alias_validation=_baseline_alias_validation,
+                verifier_timeout_sec=verifier_timeout_sec,
             )
     if find_evals_file(evaluator_skill_path) is None:
         raise FileNotFoundError(f"No evals dataset found in {evaluator_skill_path / 'evals'}")
@@ -5586,6 +5774,7 @@ def generate_harbor_tasks(
             task_resources=task_resources,
             agent_workdir=agent_workdir,
             baseline_aliases_prevalidated=baseline_aliases_prevalidated,
+            verifier_timeout_sec=verifier_timeout_sec,
         )
         relative_tasks = [task.relative_to(private_output) for task in private_tasks]
         if output_requires_provenance:

@@ -271,13 +271,15 @@ skillevaluator doctor --agents codex --env-mode docker
 | CLI package | SkillEvaluator is installed, with its version. |
 | Public LLM provider | The evaluator provider resolves — the key that powers dataset generation and grading. |
 | Agent runtime credential | The full credential and model plan for each selected agent resolves — the same plan a real run would use, including the host credentials the agents need. |
+| Judge panel | Shown only when a `SKILL_EVAL_JUDGE_PANEL*` setting is present: the [judge panel](tier3-live-evaluation.mdx#cross-model-judging) and every member credential resolve. Warns when an even member count uses `vote` aggregation. |
 | Harbor agents | Every requested agent name is known. |
 | `<env-mode>` prerequisite | The selected `--env-mode` is usable — Docker Compose responds, the local sandbox and agent CLIs are ready, or the selected Harbor backend's prerequisites are met. |
 
 `doctor` also accepts `--agent-model AGENT=MODEL` (repeatable), so you can
 check the exact model plan a run would use. Add `--verify-models` to probe
 each agent's resolved model live against the provider's catalog — one extra
-pass, warn, or fail row per agent. A warning means the catalog result is
+pass, warn, or fail row per agent, plus one `judge PROVIDER:MODEL` row per
+judge panel member. A warning means the catalog result is
 non-authoritative, such as a public NVIDIA Build listing or an OpenAI catalog
 permission failure that does not decide inference access. Browse catalog
 membership with `skillevaluator models` (top 10 by default; `--limit` and

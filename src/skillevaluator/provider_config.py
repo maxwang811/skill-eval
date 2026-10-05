@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import quote, unquote_to_bytes, urlsplit, urlunsplit
 
 import idna
@@ -54,6 +56,31 @@ _EMBEDDING_DEFAULT_MODELS = {
     "openai-compatible": EMBEDDING_DEFAULT_GATEWAY,
 }
 _SUPPORTED_PROVIDERS = frozenset({"openai", "anthropic", "nv_build", "bedrock", "openai-compatible"})
+_LITELLM_PREFIXES = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "nv_build": "openai",
+    "bedrock": "bedrock",
+    "openai-compatible": "openai",
+}
+
+# Cross-model judge panel for the three Tier 3 LLM metrics. The panel is read
+# only from the operator's host environment (or ``--judge-panel``), never from
+# skill-owned configuration, because a skill must not pick its own judges.
+# ``harbor/templates/eval.py`` parses the normalized values with the same rules.
+JUDGE_PANEL_ENV = "SKILL_EVAL_JUDGE_PANEL"
+JUDGE_PANEL_AGGREGATION_ENV = "SKILL_EVAL_JUDGE_PANEL_AGGREGATION"
+JUDGE_PANEL_QUORUM_ENV = "SKILL_EVAL_JUDGE_PANEL_QUORUM"
+JUDGE_PANEL_DISAGREEMENT_ENV = "SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT"
+JUDGE_PANEL_ENV_VARS = frozenset(
+    {JUDGE_PANEL_ENV, JUDGE_PANEL_AGGREGATION_ENV, JUDGE_PANEL_QUORUM_ENV, JUDGE_PANEL_DISAGREEMENT_ENV}
+)
+JUDGE_PANEL_AGGREGATIONS = ("vote", "median", "mean")
+JUDGE_PANEL_MAX_MEMBERS = 5
+DEFAULT_JUDGE_PANEL_DISAGREEMENT = 0.4
+_JUDGE_PANEL_KNOB_ENV_VARS = (JUDGE_PANEL_AGGREGATION_ENV, JUDGE_PANEL_QUORUM_ENV, JUDGE_PANEL_DISAGREEMENT_ENV)
+_JUDGE_MODEL_OVERRIDE_ENV_VARS = ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL")
+_JUDGE_PANEL_EXAMPLE = "openai:gpt-5.6-sol,anthropic:claude-opus-5,nv_build:nvidia/nemotron-3-super-120b-a12b"
 _ANTHROPIC_DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _ANTHROPIC_INTERNAL_LABEL_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$")
 _ANTHROPIC_IPV6_ZONE_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
@@ -125,6 +152,88 @@ class ProviderConfig:
             environment["AWS_REGION"] = self.region
 
         return environment
+
+
+@dataclass(frozen=True)
+class JudgeTarget:
+    """One resolved judge-panel member with its own credential and endpoint."""
+
+    provider: str
+    model: str
+    api_key: str | None = field(default=None, repr=False)
+    base_url: str | None = None
+    credential_env: str | None = None
+    base_url_env: str | None = None
+    region: str | None = None
+
+    @property
+    def label(self) -> str:
+        """Return the normalized ``provider:model`` identity used in config and reports."""
+        return f"{self.provider}:{self.model}"
+
+    def provider_config(self) -> ProviderConfig:
+        """Return the equivalent provider config, for example for model-catalog probing."""
+        return ProviderConfig(
+            provider=self.provider,
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            litellm_model=f"{_LITELLM_PREFIXES[self.provider]}/{self.model}",
+            region=self.region,
+            credential_env=self.credential_env,
+            base_url_env=self.base_url_env,
+        )
+
+    def verifier_environment(self) -> dict[str, str]:
+        """Return the canonical in-verifier variables this member's judge reads."""
+        if self.provider == "openai":
+            # Always pin the resolved endpoint, including the official default.
+            environment = {"OPENAI_API_KEY": self.api_key, "OPENAI_BASE_URL": self.base_url}
+        elif self.provider == "anthropic":
+            environment = {"ANTHROPIC_API_KEY": self.api_key, "ANTHROPIC_BASE_URL": self.base_url}
+        elif self.provider == "nv_build":
+            environment = {"NVIDIA_API_KEY": self.api_key}
+        elif self.provider == "bedrock":
+            environment = {"AWS_REGION": self.region}
+        else:
+            environment = {"SKILL_EVAL_LLM_API_KEY": self.api_key, "SKILL_EVAL_LLM_BASE_URL": self.base_url}
+        return {name: value for name, value in environment.items() if value}
+
+
+@dataclass(frozen=True)
+class JudgePanelConfig:
+    """Validated cross-model judge panel for the three Tier 3 LLM metrics."""
+
+    members: tuple[JudgeTarget, ...]
+    aggregation: str
+    quorum: int
+    disagreement_threshold: float
+    warnings: tuple[str, ...] = ()
+
+    def env_value(self) -> str:
+        """Return the normalized ``provider:model,...`` panel the verifier parses."""
+        return ",".join(member.label for member in self.members)
+
+    def verifier_settings(self) -> dict[str, str]:
+        """Return all four panel settings as normalized strings for the verifier."""
+        return {
+            JUDGE_PANEL_ENV: self.env_value(),
+            JUDGE_PANEL_AGGREGATION_ENV: self.aggregation,
+            JUDGE_PANEL_QUORUM_ENV: str(self.quorum),
+            JUDGE_PANEL_DISAGREEMENT_ENV: str(self.disagreement_threshold),
+        }
+
+    def redacted(self) -> dict[str, Any]:
+        """Return a JSON-safe description without credentials or endpoints."""
+        return {
+            "panel": [
+                {"provider": member.provider, "model": member.model, "label": member.label} for member in self.members
+            ],
+            "aggregation": self.aggregation,
+            "quorum": self.quorum,
+            "disagreement_threshold": self.disagreement_threshold,
+            "warnings": list(self.warnings),
+        }
 
 
 def resolve_llm_provider(environ: Mapping[str, str] | None = None) -> ProviderConfig:
@@ -244,6 +353,237 @@ def resolve_embedding_provider(environ: Mapping[str, str] | None = None) -> Prov
         ),
         base_url_env="SKILL_EVAL_EMBEDDING_BASE_URL",
     )
+
+
+def resolve_judge_panel_config(
+    environ: Mapping[str, str] | None = None,
+    *,
+    source: str = JUDGE_PANEL_ENV,
+) -> JudgePanelConfig | None:
+    """Resolve and validate the host-configured cross-model judge panel.
+
+    Returns ``None`` when ``SKILL_EVAL_JUDGE_PANEL`` is unset or blank. Every
+    member must have its own credential; a misconfigured panel is an error and
+    never falls back to the single standard judge. ``source`` names the input
+    that supplied the panel string (``--judge-panel`` when the CLI value
+    replaced the environment variable) in panel errors; errors about the three
+    tuning knobs keep their environment variable names.
+    """
+    env = _environment(environ)
+    raw_panel = env.get(JUDGE_PANEL_ENV, "").strip()
+    if not raw_panel:
+        knobs = [name for name in _JUDGE_PANEL_KNOB_ENV_VARS if env.get(name, "").strip()]
+        if knobs:
+            raise ProviderConfigurationError(
+                f"{', '.join(knobs)} configure(s) a judge panel, but {JUDGE_PANEL_ENV} is not set.\n\n"
+                f"Set the panel (or pass --judge-panel), for example:\n  export {JUDGE_PANEL_ENV}='{_JUDGE_PANEL_EXAMPLE}'\n\n"
+                f"or unset {', '.join(knobs)}; panel settings never fall back to a single judge."
+            )
+        return None
+
+    entries = _parse_judge_panel(raw_panel, source=source)
+    aggregation = env.get(JUDGE_PANEL_AGGREGATION_ENV, "").strip().lower() or "vote"
+    if aggregation not in JUDGE_PANEL_AGGREGATIONS:
+        raise ProviderConfigurationError(
+            f"{JUDGE_PANEL_AGGREGATION_ENV} must be one of: {', '.join(JUDGE_PANEL_AGGREGATIONS)}."
+        )
+    quorum = _judge_panel_quorum(env.get(JUDGE_PANEL_QUORUM_ENV, "").strip(), member_count=len(entries))
+    disagreement_threshold = _judge_panel_disagreement(env.get(JUDGE_PANEL_DISAGREEMENT_ENV, "").strip())
+    overrides = [name for name in _JUDGE_MODEL_OVERRIDE_ENV_VARS if env.get(name, "").strip()]
+    if overrides:
+        raise ProviderConfigurationError(
+            f"{source} cannot be combined with {', '.join(overrides)}: the panel names each judge's model "
+            "explicitly; unset LLM_JUDGE_MODEL/SKILL_EVAL_JUDGE_MODEL or remove the panel."
+        )
+
+    warnings: list[str] = []
+    if aggregation == "vote" and len(entries) % 2 == 0:
+        warnings.append(
+            f"Judge panel has an even number of members ({len(entries)}) with vote aggregation; tied criteria "
+            "count as 0.5. Use an odd number of judges for decisive majority votes."
+        )
+
+    primary = _primary_llm_provider(env)
+    if primary in {"openai", "anthropic"} and any(provider == "openai-compatible" for provider, _model in entries):
+        # Checked before any member is resolved or probed: a probe would already
+        # send the native key to the gateway.
+        raise ProviderConfigurationError(
+            f"{source} cannot include an openai-compatible member while the {primary} primary is selected: "
+            f"SKILL_EVAL_LLM_BASE_URL would be both the gateway member's endpoint and the {primary} primary's "
+            f"endpoint override, so the {primary} key would be sent to the gateway.\n\n"
+            "Select the gateway as the primary (SKILL_EVAL_LLM_PROVIDER=openai-compatible) and list "
+            f"{primary}:MODEL as a member, or remove the openai-compatible member."
+        )
+    members = tuple(
+        _resolve_judge_target(env, provider, model, primary=primary, source=source) for provider, model in entries
+    )
+    return JudgePanelConfig(
+        members=members,
+        aggregation=aggregation,
+        quorum=quorum,
+        disagreement_threshold=disagreement_threshold,
+        warnings=tuple(warnings),
+    )
+
+
+def resolve_judge_panel(environ: Mapping[str, str] | None = None) -> list[JudgeTarget] | None:
+    """Return the resolved judge-panel members, or ``None`` when no panel is configured."""
+    config = resolve_judge_panel_config(environ)
+    return None if config is None else list(config.members)
+
+
+def _parse_judge_panel(raw_panel: str, *, source: str = JUDGE_PANEL_ENV) -> list[tuple[str, str]]:
+    """Split ``provider:model,...`` entries, splitting each on its first colon only."""
+    entries: list[tuple[str, str]] = []
+    for position, raw_entry in enumerate(raw_panel.split(","), start=1):
+        entry = raw_entry.strip()
+        if not entry:
+            raise ProviderConfigurationError(
+                f"{source} entry {position} is empty; use comma-separated provider:model entries, "
+                f"for example {_JUDGE_PANEL_EXAMPLE}."
+            )
+        raw_provider, separator, raw_model = entry.partition(":")
+        provider = raw_provider.strip().lower()
+        model = raw_model.strip()
+        if not separator or not provider or not model:
+            raise ProviderConfigurationError(
+                f"{source} entry {entry!r} must use provider:model form, for example openai:gpt-5.6-sol."
+            )
+        _validate_provider(provider, variable=f"{source} provider {provider!r}")
+        if any(character.isspace() or unicodedata.category(character).startswith("C") for character in model):
+            raise ProviderConfigurationError(
+                f"{source} model {model!r} must not contain whitespace or control characters."
+            )
+        entries.append((provider, model))
+
+    if len(entries) > JUDGE_PANEL_MAX_MEMBERS:
+        raise ProviderConfigurationError(
+            f"{source} supports at most {JUDGE_PANEL_MAX_MEMBERS} judges to keep cost bounded; got {len(entries)}."
+        )
+    seen: set[tuple[str, str]] = set()
+    for provider, model in entries:
+        if (provider, model) in seen:
+            raise ProviderConfigurationError(f"{source} lists {provider}:{model} more than once.")
+        seen.add((provider, model))
+    if sum(provider == "openai-compatible" for provider, _model in entries) > 1:
+        raise ProviderConfigurationError(
+            f"{source} supports at most one openai-compatible member because SKILL_EVAL_LLM_BASE_URL "
+            "and SKILL_EVAL_LLM_API_KEY configure a single gateway."
+        )
+    return entries
+
+
+def _judge_panel_quorum(raw_quorum: str, *, member_count: int) -> int:
+    if not raw_quorum:
+        return member_count // 2 + 1
+    error = f"{JUDGE_PANEL_QUORUM_ENV} must be an integer between 1 and {member_count} (the number of judges)."
+    try:
+        quorum = int(raw_quorum)
+    except ValueError:
+        raise ProviderConfigurationError(error) from None
+    if not 1 <= quorum <= member_count:
+        raise ProviderConfigurationError(error)
+    return quorum
+
+
+def _judge_panel_disagreement(raw_threshold: str) -> float:
+    if not raw_threshold:
+        return DEFAULT_JUDGE_PANEL_DISAGREEMENT
+    error = f"{JUDGE_PANEL_DISAGREEMENT_ENV} must be a number between 0 and 1."
+    try:
+        threshold = float(raw_threshold)
+    except ValueError:
+        raise ProviderConfigurationError(error) from None
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ProviderConfigurationError(error)
+    return threshold
+
+
+def _primary_llm_provider(environ: Mapping[str, str]) -> str | None:
+    """Return the provider ``resolve_llm_provider`` selects, or ``None`` when it is ambiguous."""
+    try:
+        return _selected_provider(environ, "SKILL_EVAL_LLM_PROVIDER")
+    except ProviderConfigurationError:
+        return None
+
+
+def _resolve_judge_target(
+    environ: Mapping[str, str],
+    provider: str,
+    model: str,
+    *,
+    primary: str | None,
+    source: str = JUDGE_PANEL_ENV,
+) -> JudgeTarget:
+    """Resolve one member's own credential and endpoint.
+
+    ``SKILL_EVAL_LLM_BASE_URL`` overrides the primary provider's endpoint only;
+    a panel that would also need it for an ``openai-compatible`` member is
+    rejected before members are resolved.
+    """
+    label = f"{provider}:{model}"
+    if provider == "openai":
+        primary_base_url = environ.get("SKILL_EVAL_LLM_BASE_URL") if primary == "openai" else None
+        return JudgeTarget(
+            provider=provider,
+            model=model,
+            api_key=_required_judge_credential(environ, "OPENAI_API_KEY", label, source=source),
+            base_url=(primary_base_url or environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/"),
+            credential_env="OPENAI_API_KEY",
+            base_url_env="OPENAI_BASE_URL",
+        )
+    if provider == "anthropic":
+        if primary == "anthropic":
+            base_url = _anthropic_base_url(environ)
+        elif configured_base_url := environ.get("ANTHROPIC_BASE_URL"):
+            base_url = _normalize_anthropic_base_url(configured_base_url, variable="ANTHROPIC_BASE_URL")
+        else:
+            base_url = None
+        return JudgeTarget(
+            provider=provider,
+            model=model,
+            api_key=_required_judge_credential(environ, "ANTHROPIC_API_KEY", label, source=source),
+            base_url=base_url,
+            credential_env="ANTHROPIC_API_KEY",
+            base_url_env="ANTHROPIC_BASE_URL",
+        )
+    if provider == "nv_build":
+        return JudgeTarget(
+            provider=provider,
+            model=model,
+            api_key=_required_judge_credential(environ, "NVIDIA_API_KEY", label, source=source),
+            base_url=PUBLIC_NVIDIA_BUILD_BASE_URL,
+            credential_env="NVIDIA_API_KEY",
+        )
+    if provider == "bedrock":
+        return JudgeTarget(provider=provider, model=model, region=environ.get("AWS_REGION") or "us-west-2")
+    return JudgeTarget(
+        provider=provider,
+        model=model,
+        api_key=_required_judge_credential(environ, "SKILL_EVAL_LLM_API_KEY", label, source=source),
+        base_url=_required_judge_credential(environ, "SKILL_EVAL_LLM_BASE_URL", label, source=source).rstrip("/"),
+        credential_env="SKILL_EVAL_LLM_API_KEY",
+        base_url_env="SKILL_EVAL_LLM_BASE_URL",
+    )
+
+
+def _required_judge_credential(
+    environ: Mapping[str, str],
+    variable: str,
+    label: str,
+    *,
+    source: str = JUDGE_PANEL_ENV,
+) -> str:
+    value = environ.get(variable, "").strip()
+    if not value:
+        panel_input = f"{JUDGE_PANEL_ENV} (or --judge-panel)" if source == JUDGE_PANEL_ENV else source
+        raise ProviderConfigurationError(
+            f"Judge panel member {label} requires {variable}.\n\n"
+            f"Set it in your shell:\n  export {variable}='...'\n\n"
+            f"or remove {label} from {panel_input}.\n\n"
+            f"Provider setup:\n  {_PROVIDER_SETUP_URL}"
+        )
+    return value
 
 
 def _environment(environ: Mapping[str, str] | None) -> Mapping[str, str]:

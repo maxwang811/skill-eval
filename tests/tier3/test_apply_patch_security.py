@@ -331,11 +331,12 @@ def _hostile_patch(scale: int) -> str:
 
 
 def _best_elapsed(run, traj: dict, repeats: int = 5) -> tuple[float, dict]:
+    # Thread CPU time leaves out time spent descheduled, which wall-clock time counts on a busy machine.
     best = float("inf")
     for _ in range(repeats):
-        started = time.perf_counter()
+        started = time.thread_time()
         result = run(traj)
-        best = min(best, time.perf_counter() - started)
+        best = min(best, time.thread_time() - started)
     return best, result
 
 

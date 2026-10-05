@@ -9,6 +9,7 @@ on-disk Harbor result layout into data consumed by the shared report adapters.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import heapq
 import json
@@ -279,22 +280,30 @@ def _read_bounded_bytes(
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as stream:
-            metadata = os.fstat(stream.fileno())
-            if not stat.S_ISREG(metadata.st_mode):
-                _record_truncation(diagnostics, code="json_file_type", artifact=artifact, limit=0)
-                return None
-            if metadata.st_size > _MAX_JSON_BYTES:
-                _record_truncation(
-                    diagnostics,
-                    code="json_bytes",
-                    artifact=artifact,
-                    limit=_MAX_JSON_BYTES,
-                )
-                return None
+    except OSError:
+        return None
+    # os.open() succeeds on a directory, and os.fdopen() would then fail without
+    # closing the descriptor, so check the type first and close exactly once here.
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            _record_truncation(diagnostics, code="json_file_type", artifact=artifact, limit=0)
+            return None
+        if metadata.st_size > _MAX_JSON_BYTES:
+            _record_truncation(
+                diagnostics,
+                code="json_bytes",
+                artifact=artifact,
+                limit=_MAX_JSON_BYTES,
+            )
+            return None
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
             raw = stream.read(_MAX_JSON_BYTES + 1)
     except OSError:
         return None
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
     if len(raw) > _MAX_JSON_BYTES:
         _record_truncation(
             diagnostics,
@@ -582,6 +591,13 @@ def load_agent_data(
             custom_lift = _load_bounded_json(custom_lift_file, agent_diagnostics, artifact="custom_lift")
             if custom_lift is not _INVALID_JSON:
                 agent_info["custom_lift"] = custom_lift
+
+        # Written by the collector only when a cross-model judge panel scored the LLM metrics.
+        judge_panel_file = agent_dir / "judge_panel.json"
+        if judge_panel_file.exists():
+            judge_panel = _load_bounded_json(judge_panel_file, agent_diagnostics, artifact="judge_panel")
+            if isinstance(judge_panel, dict):
+                agent_info["judge_panel"] = judge_panel
 
         for variant_key, variant_dir_name in (("rewards", "with-skill"), ("rewards_baseline", "without-skill")):
             trial_list: list[dict[str, Any]] = []

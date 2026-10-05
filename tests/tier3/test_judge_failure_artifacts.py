@@ -163,6 +163,132 @@ def test_verifier_main_fails_closed_after_collecting_every_required_judge(
     assert overall_score(numeric) is None
 
 
+_JUDGE_PANEL = "openai:gpt-5.6-sol,anthropic:claude-opus-5,nv_build:nvidia/nemotron-3-super-120b-a12b"
+_JUDGE_PANEL_ENV = (
+    "SKILL_EVAL_JUDGE_PANEL",
+    "SKILL_EVAL_JUDGE_PANEL_AGGREGATION",
+    "SKILL_EVAL_JUDGE_PANEL_QUORUM",
+    "SKILL_EVAL_JUDGE_PANEL_DISAGREEMENT",
+)
+_VALID_JUDGE_RESULTS = {
+    "accuracy": {
+        "score": 1.0,
+        "reason": "valid verdict",
+        "criteria": {
+            "SKILL_IDENTIFIED": True,
+            "ACTION_CORRECT": True,
+            "FACTUALLY_ACCURATE": True,
+            "TASK_ADDRESSED": True,
+            "ACTIONABLE": True,
+        },
+    },
+    "goal_accuracy": {"score": 1.0, "reason": "valid verdict", "achieved": True, "method": "custom"},
+    "behavior_check": {"score": 1.0, "reason": "valid verdict", "results": [{"step": 1, "passed": True}]},
+}
+
+
+def _script_required_judges(
+    verifier: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failing_accuracy: frozenset[str | None],
+) -> list[tuple[str, str | None]]:
+    """Replace the three judges; accuracy fails for the listed providers (None is the single judge)."""
+    calls: list[tuple[str, str | None]] = []
+
+    def scripted(metric: str):
+        def judge(*_args, **_kwargs):
+            target = verifier._ACTIVE_JUDGE_TARGET.get()
+            provider = target.provider if target is not None else None
+            calls.append((metric, provider))
+            if metric == "accuracy" and provider in failing_accuracy:
+                return {"score": None, "status": "error", "reason": f"HTTP 401 from {provider or 'judge'}"}
+            return dict(_VALID_JUDGE_RESULTS[metric])
+
+        return judge
+
+    monkeypatch.setattr(verifier, "judge_accuracy", scripted("accuracy"))
+    monkeypatch.setattr(verifier, "judge_goal_accuracy", scripted("goal_accuracy"))
+    monkeypatch.setattr(verifier, "judge_behavior_check", scripted("behavior_check"))
+    return calls
+
+
+def test_verifier_main_below_panel_quorum_writes_the_single_judge_failure_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail a below-quorum panel metric with exactly the artifact shape of a failed single judge."""
+    for name in _JUDGE_PANEL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    single = _load_verifier(tmp_path / "single")
+    single_calls = _script_required_judges(single, monkeypatch, failing_accuracy=frozenset({None}))
+    with pytest.raises(SystemExit) as single_exit:
+        single.main()
+
+    monkeypatch.setenv("SKILL_EVAL_JUDGE_PANEL", _JUDGE_PANEL)
+    panel = _load_verifier(tmp_path / "panel")
+    panel_calls = _script_required_judges(panel, monkeypatch, failing_accuracy=frozenset({"anthropic", "nv_build"}))
+    with pytest.raises(SystemExit) as panel_exit:
+        panel.main()
+
+    assert single_exit.value.code == panel_exit.value.code == 1
+    assert single_calls == [("accuracy", None), ("goal_accuracy", None), ("behavior_check", None)]
+    assert panel_calls == [
+        (metric, provider)
+        for metric in ("accuracy", "goal_accuracy", "behavior_check")
+        for provider in ("openai", "anthropic", "nv_build")
+    ]
+
+    single_rich = json.loads(single.SKILL_EVALUATOR_REWARD_JSON.read_text(encoding="utf-8"))
+    panel_rich = json.loads(panel.SKILL_EVALUATOR_REWARD_JSON.read_text(encoding="utf-8"))
+    single_numeric = json.loads(single.REWARD_JSON.read_text(encoding="utf-8"))
+    panel_numeric = json.loads(panel.REWARD_JSON.read_text(encoding="utf-8"))
+
+    # Same deliberately incomplete reward.json, reward.txt, and sidecar layout as a failed single judge.
+    assert (
+        panel_numeric
+        == single_numeric
+        == {
+            "security": 1.0,
+            "skill_execution": 1.0,
+            "skill_efficiency": 1.0,
+            "goal_accuracy": 1.0,
+            "behavior_check": 1.0,
+            "overall": 0.0,
+        }
+    )
+    assert panel.REWARD_TXT.read_text(encoding="utf-8") == single.REWARD_TXT.read_text(encoding="utf-8") == "0.0"
+    assert list(panel_rich) == list(single_rich)
+    assert panel_rich["accuracy"] is single_rich["accuracy"] is None
+    assert panel_rich["evaluation_status"] == single_rich["evaluation_status"] == "failed"
+    assert set(panel_rich["evaluation_errors"]) == set(single_rich["evaluation_errors"]) == {"accuracy"}
+    quorum_reason = "Judge panel quorum not met for accuracy: 1/3 judges succeeded (quorum 2)"
+    assert panel_rich["evaluation_errors"]["accuracy"] == quorum_reason
+    panel_accuracy = panel_rich["details"]["accuracy"]
+    assert {key: panel_accuracy[key] for key in ("score", "status", "reason")} == {
+        "score": None,
+        "status": "error",
+        "reason": quorum_reason,
+    }
+    assert panel_accuracy["panel"]["failed_members"] == 2
+    assert [member["status"] for member in panel_accuracy["panel"]["members"]] == ["ok", "error", "error"]
+    assert set(panel_accuracy) - {"panel"} == set(single_rich["details"]["accuracy"])
+
+    # Harbor may keep only reward.json; the collector must still refuse to score either trial.
+    for verifier, expected_reason in ((single, "HTTP 401 from judge"), (panel, quorum_reason)):
+        numeric = json.loads(verifier.REWARD_JSON.read_text(encoding="utf-8"))
+        assert metric_set_for_reward(numeric)[0] == DEFAULT_METRIC_SET
+        assert overall_score(numeric) is None
+        collected = {**numeric, "_trial_name": f"{verifier.__name__}-trial"}
+        collector._merge_reward_sidecars(collected, verifier.VERIFIER_DIR)
+        scoreable, failures = collector._partition_scoreable_rewards([collected])
+        assert scoreable == []
+        assert len(failures) == 1
+        assert failures[0]["trial"] == f"{verifier.__name__}-trial"
+        assert expected_reason in failures[0]["reason"]
+        assert failures[0]["reason"].startswith("Required judge evaluation failed: accuracy: ")
+
+
 def test_verifier_retries_leave_time_to_write_failure_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

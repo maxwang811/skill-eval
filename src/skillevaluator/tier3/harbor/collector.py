@@ -23,6 +23,11 @@ from typing import Any
 
 from skillevaluator.tier3.eval_core.atif_helpers import extract_tool_calls_as_dicts, get_skill_tool_calls
 from skillevaluator.tier3.eval_core.checks import check_negative_case
+from skillevaluator.tier3.harbor.judge_panel_stats import (
+    PanelRewardRow,
+    build_judge_panel_report,
+    judge_panel_result_summary,
+)
 from skillevaluator.tier3.harbor.metrics import (
     DEFAULT_METRIC_SET,
     DEFAULT_METRICS,
@@ -67,6 +72,7 @@ GENERATED_AGENT_ARTIFACTS = (
     "pass_at_k_lift.json",
     "security_attribution.json",
     "findings.json",
+    "judge_panel.json",
 )
 GENERATED_CONDITION_DIRS = ("with-skill", "without-skill")
 GENERATED_ROOT_ARTIFACTS = ("attempt_policy.json", "comparison.json")
@@ -3010,6 +3016,32 @@ def _aggregate_execution(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _judge_panel_rows(
+    condition: str,
+    rewards: list[dict[str, Any]],
+    execution: dict[str, Any],
+    expected_case_ids: list[str] | None,
+) -> list[PanelRewardRow]:
+    """Describe one condition's scoreable rewards for judge-panel statistics.
+
+    A failed or skipped condition publishes no quality scores, so it contributes
+    no judge statistics either.
+    """
+    if execution.get("execution_status") != "succeeded":
+        return []
+    expected_ids = {str(case_id) for case_id in expected_case_ids or [] if str(case_id)} or None
+    return [
+        PanelRewardRow(
+            condition=condition,
+            trial_id=str(reward.get("_trial_root_name") or reward.get("_trial_name") or f"__row_{index}"),
+            entry_id=_entry_id(reward, expected_ids),
+            reward=reward,
+            step=str(reward.get("_step_name") or "") or None,
+        )
+        for index, reward in enumerate(rewards)
+    ]
+
+
 def collect_harbor_results(
     skill_name: str,
     agents: list[str],
@@ -3444,6 +3476,18 @@ def collect_harbor_results(
                     agent_model_source=agent_model_source,
                 )
 
+        # Only rewards scored by a cross-model judge panel produce this report.
+        judge_panel = build_judge_panel_report(
+            [
+                *_judge_panel_rows("with_skill", with_rewards, with_execution, expected_case_ids),
+                *_judge_panel_rows("without_skill", without_rewards, without_execution, expected_case_ids),
+            ],
+            arm_scores={"with_skill": with_scores, "without_skill": without_scores},
+            agent_model=agent_model,
+        )
+        if judge_panel is not None:
+            (agent_dir / "judge_panel.json").write_text(json.dumps(judge_panel, indent=2), encoding="utf-8")
+
         agent_execution = _aggregate_execution([with_execution, without_execution])
         all_results["agents"][agent] = {
             "model": agent_model,
@@ -3487,6 +3531,8 @@ def collect_harbor_results(
             "num_trials_without": len(without_rewards) if not skip_baseline else 0,
             "output_dir": str(agent_dir.resolve()),
         }
+        if judge_panel is not None:
+            all_results["agents"][agent]["judge_panel"] = judge_panel_result_summary(judge_panel)
 
     _write_generated_root_json(output_dir / "attempt_policy.json", output_dir, all_results["attempt_policy"])
 
